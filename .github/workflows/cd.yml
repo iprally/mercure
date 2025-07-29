@@ -1,0 +1,59 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - feature/iam-valkey
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Sync tags from upstream repository and get latest tag
+        id: get-latest-tag
+        run: |
+          git remote add upstream https://github.com/dunglas/mercure.git
+          echo "Fetching tags from upstream..."
+          git fetch upstream --tags
+          latest_tag=$(git tag --sort=-v:refname | head -n 1)
+          echo "Latest tag is: $latest_tag"
+          echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          access_token_lifetime: 3600s
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: '${{ secrets.GCP_SERVICE_ACCOUNT }}'
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Login to Google Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.GAR_REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ secrets.MERCURE_PACKAGE_NAME }}:${{ steps.get-latest-tag.outputs.latest_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
