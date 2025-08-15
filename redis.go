@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 	"golang.org/x/oauth2/google"
 )
 
@@ -138,6 +139,12 @@ func NewRedisTransportWithConfig(logger Logger, config *RedisConfig) (*RedisTran
 		return nil, fmt.Errorf("failed to connect to Redis: %w", pong.Err())
 	}
 
+	// Log successful Redis connection
+	logger.Info("Redis connection established",
+		zap.String("address", config.Address),
+		zap.Bool("useIAM", config.UseIAMAuth),
+	)
+
 	return NewRedisTransportInstance(logger, client, config.SubscribersSize, config.RedisChannel)
 }
 
@@ -234,6 +241,11 @@ func NewRedisTransportInstance(
 			if err := client.Close(); err != nil && !errors.Is(err, redis.ErrClosed) {
 				logger.Error(err.Error())
 			}
+
+			// Log Redis connection closure
+			logger.Info("Redis connection closed",
+				zap.String("address", transport.client.Options().Addr),
+			)
 		case <-subscribeCtx.Done():
 		}
 	}()
@@ -337,6 +349,11 @@ func (t *RedisTransport) Close() (err error) {
 	t.closedOnce.Do(func() {
 		t.Lock()
 		defer t.Unlock()
+
+		// Log transport shutdown
+		t.logger.Info("Redis transport shutting down",
+			zap.String("address", t.client.Options().Addr),
+		)
 
 		t.subscribers.Walk(0, func(s *LocalSubscriber) bool {
 			s.Disconnect()
