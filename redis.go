@@ -14,9 +14,12 @@ import (
 )
 
 const (
-	lastEventIDKey = "lastEventID"
-	publishScript  = `
+	lastEventIDKey      = "lastEventID"
+	defaultHistorySize  = 1000
+	historyStreamSuffix = ":history"
+	publishScript       = `
 		redis.call("SET", KEYS[1], ARGV[1])
+		redis.call("XADD", KEYS[2], "MAXLEN", "~", ARGV[4], "*", "id", ARGV[1], "payload", ARGV[3])
 		redis.call("PUBLISH", ARGV[2], ARGV[3])
 		return true
 	`
@@ -27,13 +30,14 @@ var errAuthFailed = errors.New("AUTH failed")
 type RedisTransport struct {
 	sync.RWMutex
 
-	logger        Logger
-	client        *redis.Client
-	subscribers   *SubscriberList
-	closed        chan any
-	publishScript *redis.Script
-	closedOnce    sync.Once
-	redisChannel  string
+	logger           Logger
+	client           *redis.Client
+	subscribers      *SubscriberList
+	closed           chan any
+	publishScript    *redis.Script
+	closedOnce       sync.Once
+	redisChannel     string
+	historyStreamKey string
 }
 
 // RedisConfig holds configuration for Redis connection.
@@ -221,12 +225,13 @@ func NewRedisTransportInstance(
 	subscribeCtx, subscribeCancel := context.WithCancel(context.Background())
 
 	transport := &RedisTransport{
-		logger:        logger,
-		client:        client,
-		subscribers:   NewSubscriberList(subscribersSize),
-		publishScript: redis.NewScript(publishScript),
-		closed:        make(chan any),
-		redisChannel:  redisChannel,
+		logger:           logger,
+		client:           client,
+		subscribers:      NewSubscriberList(subscribersSize),
+		publishScript:    redis.NewScript(publishScript),
+		closed:           make(chan any),
+		redisChannel:     redisChannel,
+		historyStreamKey: redisChannel + historyStreamSuffix,
 	}
 
 	go func() {
@@ -281,8 +286,8 @@ func (t *RedisTransport) Dispatch(update *Update) error {
 
 	AssignUUID(update)
 
-	keys := []string{lastEventIDKey}
-	arguments := []interface{}{update.ID, t.redisChannel, update}
+	keys := []string{lastEventIDKey, t.historyStreamKey}
+	arguments := []interface{}{update.ID, t.redisChannel, update, defaultHistorySize}
 
 	_, err := t.publishScript.Run(context.Background(), t.client, keys, arguments...).Result()
 	if err != nil {
@@ -304,7 +309,7 @@ func (t *RedisTransport) AddSubscriber(s *LocalSubscriber) error {
 	t.Unlock()
 
 	if s.RequestLastEventID != "" {
-		s.HistoryDispatched(EarliestLastEventID)
+		t.dispatchHistory(s)
 	}
 
 	s.Ready()
@@ -365,6 +370,56 @@ func (t *RedisTransport) Close() (err error) {
 	})
 
 	return nil
+}
+
+func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
+	entries, err := t.client.XRange(context.Background(), t.historyStreamKey, "-", "+").Result()
+	if err != nil {
+		t.logger.Error("failed to read history stream", zap.Error(err))
+		s.HistoryDispatched(EarliestLastEventID)
+
+		return
+	}
+
+	afterLastEventID := s.RequestLastEventID == EarliestLastEventID
+	responseLastEventID := EarliestLastEventID
+
+	for _, entry := range entries {
+		eventID, _ := entry.Values["id"].(string)
+
+		if !afterLastEventID {
+			responseLastEventID = eventID
+			if eventID == s.RequestLastEventID {
+				afterLastEventID = true
+			}
+
+			continue
+		}
+
+		payload, ok := entry.Values["payload"].(string)
+		if !ok {
+			continue
+		}
+
+		var update Update
+		if err := json.Unmarshal([]byte(payload), &update); err != nil {
+			t.logger.Error("failed to unmarshal history entry", zap.Error(err))
+
+			continue
+		}
+
+		if s.Match(&update) {
+			if !s.Dispatch(&update, true) {
+				s.HistoryDispatched(responseLastEventID)
+
+				return
+			}
+		}
+
+		responseLastEventID = eventID
+	}
+
+	s.HistoryDispatched(responseLastEventID)
 }
 
 func (t *RedisTransport) subscribe(ctx context.Context, cancel context.CancelFunc, subscriber *redis.PubSub) {

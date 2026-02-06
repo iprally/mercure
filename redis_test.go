@@ -86,6 +86,30 @@ func TestRedisClose(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestRedisHistoryReplay(t *testing.T) {
+	transport := initialize()
+	defer transport.Close()
+
+	topics := []string{"https://topics.local/topic"}
+
+	// Publish event A — the subscriber's "last seen" event
+	eventA := &Update{Topics: topics, Event: Event{Data: "event-a"}}
+	require.NoError(t, transport.Dispatch(eventA))
+
+	// Publish event B — subscriber is disconnected and misses this
+	eventB := &Update{Topics: topics, Event: Event{Data: "event-b"}}
+	require.NoError(t, transport.Dispatch(eventB))
+
+	// Subscriber reconnects with Last-Event-ID = eventA.ID
+	subscriber := NewLocalSubscriber(eventA.ID, transport.logger, &TopicSelectorStore{})
+	subscriber.SetTopics(topics, nil)
+	require.NoError(t, transport.AddSubscriber(subscriber))
+
+	// Should receive event B from history replay
+	received := <-subscriber.Receive()
+	assert.Equal(t, "event-b", received.Data, "subscriber should receive the missed event from history")
+}
+
 func TestRedisConcurrent(t *testing.T) {
 	transport1 := initialize()
 	transport2 := initialize()
