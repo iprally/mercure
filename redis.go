@@ -372,6 +372,16 @@ func (t *RedisTransport) Close() (err error) {
 	return nil
 }
 
+func containsEventID(entries []redis.XMessage, id string) bool {
+	for _, entry := range entries {
+		if eventID, _ := entry.Values["id"].(string); eventID == id {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
 	entries, err := t.client.XRange(context.Background(), t.historyStreamKey, "-", "+").Result()
 	if err != nil {
@@ -384,22 +394,10 @@ func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
 	afterLastEventID := s.RequestLastEventID == EarliestLastEventID
 	responseLastEventID := EarliestLastEventID
 
-	// If the requested Last-Event-ID is not "earliest", check if it exists in the stream.
-	// If it has been evicted (due to MAXLEN trimming), replay all available events
-	// rather than silently dispatching nothing.
-	if !afterLastEventID {
-		found := false
-		for _, entry := range entries {
-			if eventID, _ := entry.Values["id"].(string); eventID == s.RequestLastEventID {
-				found = true
-
-				break
-			}
-		}
-
-		if !found {
-			afterLastEventID = true
-		}
+	// If the requested Last-Event-ID has been evicted (due to MAXLEN trimming),
+	// replay all available events rather than silently dispatching nothing.
+	if !afterLastEventID && !containsEventID(entries, s.RequestLastEventID) {
+		afterLastEventID = true
 	}
 
 	for _, entry := range entries {

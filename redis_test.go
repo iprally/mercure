@@ -1,6 +1,7 @@
 package mercure
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,9 @@ const (
 
 func initialize() *RedisTransport {
 	transport, _ := NewRedisTransport(zap.NewNop(), redisHost, "", "", redisSubscriberSize, redisChannel)
+
+	// Flush leftover data from previous tests to ensure clean state
+	transport.client.FlushDB(context.Background())
 
 	return transport
 }
