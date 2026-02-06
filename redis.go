@@ -15,7 +15,7 @@ import (
 
 const (
 	lastEventIDKey      = "lastEventID"
-	defaultHistorySize  = 1000
+	defaultHistorySize  = 20
 	historyStreamSuffix = ":history"
 	publishScript       = `
 		redis.call("SET", KEYS[1], ARGV[1])
