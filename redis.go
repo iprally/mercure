@@ -15,7 +15,7 @@ import (
 
 const (
 	lastEventIDKey      = "lastEventID"
-	defaultHistorySize  = 20
+	defaultHistorySize  = 100
 	historyStreamSuffix = ":history"
 	publishScript       = `
 		redis.call("SET", KEYS[1], ARGV[1])
@@ -38,6 +38,7 @@ type RedisTransport struct {
 	closedOnce       sync.Once
 	redisChannel     string
 	historyStreamKey string
+	historySize      int
 }
 
 // RedisConfig holds configuration for Redis connection.
@@ -47,6 +48,7 @@ type RedisConfig struct {
 	Password        string
 	SubscribersSize int
 	RedisChannel    string
+	HistorySize     int
 	// IAM authentication for Google Cloud Memorystore.
 	UseIAMAuth bool
 	ProjectID  string
@@ -61,6 +63,7 @@ func NewRedisTransport(
 	password string,
 	subscribersSize int,
 	redisChannel string,
+	historySize int,
 ) (*RedisTransport, error) {
 	config := &RedisConfig{
 		Address:         address,
@@ -68,6 +71,7 @@ func NewRedisTransport(
 		Password:        password,
 		SubscribersSize: subscribersSize,
 		RedisChannel:    redisChannel,
+		HistorySize:     historySize,
 		UseIAMAuth:      false,
 	}
 
@@ -82,6 +86,7 @@ func NewRedisTransportWithIAM(
 	instanceID string,
 	subscribersSize int,
 	redisChannel string,
+	historySize int,
 ) (*RedisTransport, error) {
 	// For Google Cloud Memorystore, the address should be the actual Redis endpoint
 	// The format is typically: <instance-ip>:6379
@@ -90,6 +95,7 @@ func NewRedisTransportWithIAM(
 		Address:         fmt.Sprintf("%s:%s:%s", projectID, location, instanceID),
 		SubscribersSize: subscribersSize,
 		RedisChannel:    redisChannel,
+		HistorySize:     historySize,
 		UseIAMAuth:      true,
 		ProjectID:       projectID,
 		Location:        location,
@@ -106,11 +112,13 @@ func NewRedisTransportWithIAMAddress(
 	projectID string,
 	subscribersSize int,
 	redisChannel string,
+	historySize int,
 ) (*RedisTransport, error) {
 	config := &RedisConfig{
 		Address:         address,
 		SubscribersSize: subscribersSize,
 		RedisChannel:    redisChannel,
+		HistorySize:     historySize,
 		UseIAMAuth:      true,
 		ProjectID:       projectID,
 	}
@@ -149,7 +157,7 @@ func NewRedisTransportWithConfig(logger Logger, config *RedisConfig) (*RedisTran
 		zap.Bool("useIAM", config.UseIAMAuth),
 	)
 
-	return NewRedisTransportInstance(logger, client, config.SubscribersSize, config.RedisChannel)
+	return NewRedisTransportInstance(logger, client, config.SubscribersSize, config.RedisChannel, config.HistorySize)
 }
 
 // createRedisClientWithIAM creates a Redis client with IAM authentication.
@@ -219,7 +227,12 @@ func NewRedisTransportInstance(
 	client *redis.Client,
 	subscribersSize int,
 	redisChannel string,
+	historySize int,
 ) (*RedisTransport, error) {
+	if historySize <= 0 {
+		historySize = defaultHistorySize
+	}
+
 	subscriber := client.PSubscribe(context.Background(), redisChannel)
 
 	subscribeCtx, subscribeCancel := context.WithCancel(context.Background())
@@ -232,6 +245,7 @@ func NewRedisTransportInstance(
 		closed:           make(chan any),
 		redisChannel:     redisChannel,
 		historyStreamKey: redisChannel + historyStreamSuffix,
+		historySize:      historySize,
 	}
 
 	go func() {
@@ -287,7 +301,7 @@ func (t *RedisTransport) Dispatch(update *Update) error {
 	AssignUUID(update)
 
 	keys := []string{lastEventIDKey, t.historyStreamKey}
-	arguments := []interface{}{update.ID, t.redisChannel, update, defaultHistorySize}
+	arguments := []interface{}{update.ID, t.redisChannel, update, t.historySize}
 
 	_, err := t.publishScript.Run(context.Background(), t.client, keys, arguments...).Result()
 	if err != nil {
@@ -372,16 +386,6 @@ func (t *RedisTransport) Close() (err error) {
 	return nil
 }
 
-func containsEventID(entries []redis.XMessage, id string) bool {
-	for _, entry := range entries {
-		if eventID, _ := entry.Values["id"].(string); eventID == id {
-			return true
-		}
-	}
-
-	return false
-}
-
 func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
 	entries, err := t.client.XRange(context.Background(), t.historyStreamKey, "-", "+").Result()
 	if err != nil {
@@ -393,12 +397,6 @@ func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
 
 	afterLastEventID := s.RequestLastEventID == EarliestLastEventID
 	responseLastEventID := EarliestLastEventID
-
-	// If the requested Last-Event-ID has been evicted (due to MAXLEN trimming),
-	// replay all available events rather than silently dispatching nothing.
-	if !afterLastEventID && !containsEventID(entries, s.RequestLastEventID) {
-		afterLastEventID = true
-	}
 
 	for _, entry := range entries {
 		eventID, _ := entry.Values["id"].(string)
@@ -436,6 +434,12 @@ func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
 	}
 
 	s.HistoryDispatched(responseLastEventID)
+
+	if !afterLastEventID {
+		if c := t.logger.Check(zap.InfoLevel, "Can't find requested LastEventID"); c != nil {
+			c.Write(zap.String("LastEventID", s.RequestLastEventID))
+		}
+	}
 }
 
 func (t *RedisTransport) subscribe(ctx context.Context, cancel context.CancelFunc, subscriber *redis.PubSub) {

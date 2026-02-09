@@ -18,7 +18,7 @@ const (
 )
 
 func initialize() *RedisTransport {
-	transport, _ := NewRedisTransport(zap.NewNop(), redisHost, "", "", redisSubscriberSize, redisChannel)
+	transport, _ := NewRedisTransport(zap.NewNop(), redisHost, "", "", redisSubscriberSize, redisChannel, 0)
 
 	// Flush leftover data from previous tests to ensure clean state
 	transport.client.FlushDB(context.Background())
@@ -127,17 +127,18 @@ func TestRedisHistoryReplayEvictedID(t *testing.T) {
 	eventB := &Update{Topics: topics, Event: Event{Data: "event-b"}}
 	require.NoError(t, transport.Dispatch(eventB))
 
-	// Subscriber reconnects with a Last-Event-ID that has been evicted from the stream
+	// Subscriber reconnects with a Last-Event-ID that has been evicted from the stream.
+	// Like BoltDB, no history should be replayed when the ID is not found.
 	subscriber := NewLocalSubscriber("urn:uuid:evicted-id", transport.logger, &TopicSelectorStore{})
 	subscriber.SetTopics(topics, nil)
 	require.NoError(t, transport.AddSubscriber(subscriber))
 
-	// Should receive all available events since the requested ID was not found
-	received1 := <-subscriber.Receive()
-	assert.Equal(t, "event-a", received1.Data, "should receive first available event when Last-Event-ID is evicted")
+	// Dispatch a new live event to verify the subscriber still works
+	eventC := &Update{Topics: topics, Event: Event{Data: "event-c"}}
+	require.NoError(t, transport.Dispatch(eventC))
 
-	received2 := <-subscriber.Receive()
-	assert.Equal(t, "event-b", received2.Data, "should receive second available event when Last-Event-ID is evicted")
+	received := <-subscriber.Receive()
+	assert.Equal(t, "event-c", received.Data, "subscriber should only receive live events when Last-Event-ID is evicted")
 }
 
 func TestRedisConcurrent(t *testing.T) {
