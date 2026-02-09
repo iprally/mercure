@@ -21,6 +21,7 @@ type Redis struct {
 	Password        string `json:"password,omitempty"`
 	SubscribersSize int    `json:"subscribers_size,omitempty"`
 	RedisChannel    string `json:"redis_channel,omitempty"`
+	HistorySize     int    `json:"history_size,omitempty"`
 	// IAM authentication for Google Cloud Memorystore
 	UseIAMAuth      bool   `json:"use_iam_auth,omitempty"`
 	ProjectID       string `json:"project_id,omitempty"`
@@ -58,10 +59,10 @@ func (r *Redis) Provision(ctx caddy.Context) error {
 			if r.ProjectID == "" {
 				return nil, fmt.Errorf("project_id is required when using IAM authentication")
 			}
-			t, err = mercure.NewRedisTransportWithIAMAddress(ctx.Logger(), r.Address, r.ProjectID, r.SubscribersSize, r.RedisChannel)
+			t, err = mercure.NewRedisTransportWithIAMAddress(ctx.Logger(), r.Address, r.ProjectID, r.SubscribersSize, r.RedisChannel, r.HistorySize)
 		} else {
 			// Use traditional authentication
-			t, err = mercure.NewRedisTransport(ctx.Logger(), r.Address, r.Username, r.Password, r.SubscribersSize, r.RedisChannel)
+			t, err = mercure.NewRedisTransport(ctx.Logger(), r.Address, r.Username, r.Password, r.SubscribersSize, r.RedisChannel, r.HistorySize)
 		}
 
 		if err != nil {
@@ -149,6 +150,18 @@ func (r *Redis) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 
 				r.ProjectID = replacer.ReplaceKnown(d.Val(), "")
+
+			case "history_size":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+
+				s, e := strconv.Atoi(replacer.ReplaceKnown(d.Val(), ""))
+				if e != nil {
+					return e
+				}
+
+				r.HistorySize = s
 			}
 		}
 	}
