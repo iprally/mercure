@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -126,6 +127,10 @@ func TestRedisHistoryReplayEvictedID(t *testing.T) {
 
 	eventB := &Update{Topics: topics, Event: Event{Data: "event-b"}}
 	require.NoError(t, transport.Dispatch(eventB))
+
+	// Wait for pub/sub messages to be consumed by the subscribe goroutine
+	// before adding the subscriber, so they don't leak into the liveQueue.
+	time.Sleep(100 * time.Millisecond)
 
 	// Subscriber reconnects with a Last-Event-ID that has been evicted from the stream.
 	// Like BoltDB, no history should be replayed when the ID is not found.
