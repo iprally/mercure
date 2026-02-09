@@ -1,6 +1,7 @@
 package mercure
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,9 @@ const (
 
 func initialize() *RedisTransport {
 	transport, _ := NewRedisTransport(zap.NewNop(), redisHost, "", "", redisSubscriberSize, redisChannel)
+
+	// Flush leftover data from previous tests to ensure clean state
+	transport.client.FlushDB(context.Background())
 
 	return transport
 }
@@ -84,6 +88,56 @@ func TestRedisClose(t *testing.T) {
 	assert.Equal(t, transport.Dispatch(&Update{Topics: subscriber.SubscribedTopics}), ErrClosedTransport)
 	_, ok := <-subscriber.out
 	assert.False(t, ok)
+}
+
+func TestRedisHistoryReplay(t *testing.T) {
+	transport := initialize()
+	defer transport.Close()
+
+	topics := []string{"https://topics.local/topic"}
+
+	// Publish event A — the subscriber's "last seen" event
+	eventA := &Update{Topics: topics, Event: Event{Data: "event-a"}}
+	require.NoError(t, transport.Dispatch(eventA))
+
+	// Publish event B — subscriber is disconnected and misses this
+	eventB := &Update{Topics: topics, Event: Event{Data: "event-b"}}
+	require.NoError(t, transport.Dispatch(eventB))
+
+	// Subscriber reconnects with Last-Event-ID = eventA.ID
+	subscriber := NewLocalSubscriber(eventA.ID, transport.logger, &TopicSelectorStore{})
+	subscriber.SetTopics(topics, nil)
+	require.NoError(t, transport.AddSubscriber(subscriber))
+
+	// Should receive event B from history replay
+	received := <-subscriber.Receive()
+	assert.Equal(t, "event-b", received.Data, "subscriber should receive the missed event from history")
+}
+
+func TestRedisHistoryReplayEvictedID(t *testing.T) {
+	transport := initialize()
+	defer transport.Close()
+
+	topics := []string{"https://topics.local/topic"}
+
+	// Publish events while subscriber is disconnected
+	eventA := &Update{Topics: topics, Event: Event{Data: "event-a"}}
+	require.NoError(t, transport.Dispatch(eventA))
+
+	eventB := &Update{Topics: topics, Event: Event{Data: "event-b"}}
+	require.NoError(t, transport.Dispatch(eventB))
+
+	// Subscriber reconnects with a Last-Event-ID that has been evicted from the stream
+	subscriber := NewLocalSubscriber("urn:uuid:evicted-id", transport.logger, &TopicSelectorStore{})
+	subscriber.SetTopics(topics, nil)
+	require.NoError(t, transport.AddSubscriber(subscriber))
+
+	// Should receive all available events since the requested ID was not found
+	received1 := <-subscriber.Receive()
+	assert.Equal(t, "event-a", received1.Data, "should receive first available event when Last-Event-ID is evicted")
+
+	received2 := <-subscriber.Receive()
+	assert.Equal(t, "event-b", received2.Data, "should receive second available event when Last-Event-ID is evicted")
 }
 
 func TestRedisConcurrent(t *testing.T) {
