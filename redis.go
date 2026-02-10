@@ -436,7 +436,7 @@ func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
 	s.HistoryDispatched(responseLastEventID)
 
 	if !afterLastEventID {
-		if c := t.logger.Check(zap.InfoLevel, "Can't find requested LastEventID"); c != nil {
+		if c := t.logger.Check(zap.DebugLevel, "Can't find requested LastEventID"); c != nil {
 			c.Write(zap.String("LastEventID", s.RequestLastEventID))
 		}
 	}
