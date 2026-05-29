@@ -75,11 +75,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "latest"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: conformance-tests/package-lock.json
 
-      - name: Install Playwrigth dependencies
+      - name: Install Playwright dependencies
         working-directory: conformance-tests/
         run: npm ci
 
