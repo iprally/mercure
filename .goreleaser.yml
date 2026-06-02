@@ -17,8 +17,10 @@ builds:
   - id: caddy
     dir: caddy/mercure
     ldflags:
+      - -X 'github.com/caddyserver/caddy/v2/modules/caddyhttp.ServerHeader=Mercure.rocks Caddy'
       - -X 'github.com/caddyserver/caddy/v2.CustomVersion=Mercure.rocks {{ .Version }} Caddy'
     tags:
+      - deprecated_transport
       - nobadger
       - nomysql
       - nopgx
@@ -35,11 +37,17 @@ builds:
       - "5"
       - "6"
       - "7"
+    ignore:
+      - goos: windows
+        goarch: arm
   # Legacy build
   - id: legacy
     dir: cmd/mercure
     ldflags:
       - -s -w -X github.com/dunglas/mercure/common.version={{ .Version }} -X github.com/dunglas/mercure/common.commit={{ .ShortCommit }} -X github.com/dunglas/mercure/common.buildDate={{ .Date }}
+    tags:
+      - deprecated_transport
+      - deprecated_server
     goos:
       - linux
       - darwin
@@ -49,10 +57,9 @@ builds:
       - amd64
       - arm
       - arm64
-upx:
-  - enabled: true
-    goos: [linux]
-    compress: best
+    ignore:
+      - goos: windows
+        goarch: arm
 archives:
   - ids:
       - caddy
@@ -71,7 +78,7 @@ archives:
       - dev.Caddyfile
     format_overrides:
       - goos: windows
-        formats: [ zip ]
+        formats: [zip]
   - id: legacy
     ids:
       - legacy
@@ -88,17 +95,20 @@ archives:
       - README.md
     format_overrides:
       - goos: windows
-        formats: [ zip ]
+        formats: [zip]
 dockers:
   - ids:
       - caddy
     goos: linux
     goarch: amd64
     image_templates:
+      # Rolling tags (vN, vN.M, latest) are suppressed on prereleases so
+      # a 1.0.0-beta.X cut does not move :latest/:v1 off the stable line.
+      # GoReleaser drops empty entries, so the {{ if }} blocks emit no tag.
       - "dunglas/mercure:{{ .Tag }}-amd64"
-      - "dunglas/mercure:v{{ .Major }}-amd64"
-      - "dunglas/mercure:v{{ .Major }}.{{ .Minor }}-amd64"
-      - "dunglas/mercure:latest-amd64"
+      - "{{ if not .Prerelease }}dunglas/mercure:v{{ .Major }}-amd64{{ end }}"
+      - "{{ if not .Prerelease }}dunglas/mercure:v{{ .Major }}.{{ .Minor }}-amd64{{ end }}"
+      - "{{ if not .Prerelease }}dunglas/mercure:latest-amd64{{ end }}"
     use: buildx
     build_flag_templates:
       - "--platform=linux/amd64"
@@ -111,9 +121,9 @@ dockers:
     goarch: arm64
     image_templates:
       - "dunglas/mercure:{{ .Tag }}-arm64v8"
-      - "dunglas/mercure:v{{ .Major }}-arm64v8"
-      - "dunglas/mercure:v{{ .Major }}.{{ .Minor }}-arm64v8"
-      - "dunglas/mercure:latest-arm64v8"
+      - "{{ if not .Prerelease }}dunglas/mercure:v{{ .Major }}-arm64v8{{ end }}"
+      - "{{ if not .Prerelease }}dunglas/mercure:v{{ .Major }}.{{ .Minor }}-arm64v8{{ end }}"
+      - "{{ if not .Prerelease }}dunglas/mercure:latest-arm64v8{{ end }}"
     use: buildx
     build_flag_templates:
       - "--platform=linux/arm64/v8"
@@ -125,23 +135,28 @@ dockers:
     dockerfile: Dockerfile.legacy
     image_templates:
       - "dunglas/mercure:legacy-{{ .Tag }}"
-      - "dunglas/mercure:legacy-v{{ .Major }}"
-      - "dunglas/mercure:legacy-v{{ .Major }}.{{ .Minor }}"
-      - "dunglas/mercure:legacy-latest"
+      - "{{ if not .Prerelease }}dunglas/mercure:legacy-v{{ .Major }}{{ end }}"
+      - "{{ if not .Prerelease }}dunglas/mercure:legacy-v{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if not .Prerelease }}dunglas/mercure:legacy-latest{{ end }}"
 docker_manifests:
   - name_template: dunglas/mercure:{{ .Tag }}
     image_templates:
       - dunglas/mercure:{{ .Tag }}-amd64
       - dunglas/mercure:{{ .Tag }}-arm64v8
+  # Rolling manifests are skipped on prereleases (name_template cannot
+  # be empty, so use skip_push instead of an {{ if }} wrap).
   - name_template: dunglas/mercure:v{{ .Major }}
+    skip_push: "{{ .Prerelease }}"
     image_templates:
       - dunglas/mercure:v{{ .Major }}-amd64
       - dunglas/mercure:v{{ .Major }}-arm64v8
   - name_template: dunglas/mercure:v{{ .Major }}.{{ .Minor }}
+    skip_push: "{{ .Prerelease }}"
     image_templates:
       - dunglas/mercure:v{{ .Major }}.{{ .Minor }}-amd64
       - dunglas/mercure:v{{ .Major }}.{{ .Minor }}-arm64v8
   - name_template: dunglas/mercure:latest
+    skip_push: "{{ .Prerelease }}"
     image_templates:
       - dunglas/mercure:latest-amd64
       - dunglas/mercure:latest-arm64v8
@@ -160,7 +175,7 @@ nfpms:
     license: "AGPL-3.0-or-later"
     vendor: "Dunglas Services SAS"
     homepage: "https://mercure.rocks"
-    bindir: /usr/bin 
+    bindir: /usr/bin
 signs:
   - artifacts: checksum
     args:

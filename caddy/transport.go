@@ -16,15 +16,17 @@ type TransportDestructor[T mercure.Transport] struct {
 }
 
 func (d TransportDestructor[T]) Destruct() error {
-	return d.Transport.Close() //nolint:wrapcheck
+	return d.Transport.Close(caddy.ActiveContext()) //nolint:wrapcheck
 }
 
 type (
-	subscriptionsKeyType struct{}
-	writeTimeoutKeyType  struct{}
+	subscriptionsKeyType        struct{}
+	writeTimeoutKeyType         struct{}
+	subscriberListCacheSizeType struct{}
 )
 
 var (
-	SubscriptionsContextKey = subscriptionsKeyType{} //nolint:gochecknoglobals
-	WriteTimeoutContextKey  = writeTimeoutKeyType{}  //nolint:gochecknoglobals
+	SubscriptionsContextKey           = subscriptionsKeyType{}        //nolint:gochecknoglobals
+	WriteTimeoutContextKey            = writeTimeoutKeyType{}         //nolint:gochecknoglobals
+	SubscriberListCacheSizeContextKey = subscriberListCacheSizeType{} //nolint:gochecknoglobals
 )

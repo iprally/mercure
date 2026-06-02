@@ -1,19 +1,27 @@
 package mercure
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"time"
 
-	"go.uber.org/zap"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
+
+type subscriberContextKeyType struct{}
+
+var SubscriberContextKey subscriberContextKeyType //nolint:gochecknoglobals
 
 type responseController struct {
 	http.ResponseController
 
 	rw http.ResponseWriter
+
 	// disconnectionTime is the JWT expiration date minus hub.dispatchTimeout, or time.Now() plus hub.writeTimeout minus hub.dispatchTimeout
 	disconnectionTime time.Time
 	// writeDeadline is the JWT expiration date or time.Now() + hub.writeTimeout
@@ -22,7 +30,7 @@ type responseController struct {
 	subscriber    *LocalSubscriber
 }
 
-func (rc *responseController) setDispatchWriteDeadline() bool {
+func (rc *responseController) setDispatchWriteDeadline(ctx context.Context) bool {
 	if rc.hub.dispatchTimeout == 0 {
 		return true
 	}
@@ -32,10 +40,8 @@ func (rc *responseController) setDispatchWriteDeadline() bool {
 		return true
 	}
 
-	if err := rc.SetWriteDeadline(deadline); err != nil {
-		if c := rc.hub.logger.Check(zap.ErrorLevel, "Unable to set dispatch write deadline"); c != nil {
-			c.Write(zap.Object("subscriber", rc.subscriber), zap.Error(err))
-		}
+	if err := rc.SetWriteDeadline(deadline); err != nil && rc.hub.logger.Enabled(ctx, slog.LevelInfo) {
+		rc.hub.logger.LogAttrs(ctx, slog.LevelInfo, "Unable to set dispatch write deadline", slog.Any("error", err))
 
 		return false
 	}
@@ -43,15 +49,9 @@ func (rc *responseController) setDispatchWriteDeadline() bool {
 	return true
 }
 
-func (rc *responseController) setDefaultWriteDeadline() bool {
+func (rc *responseController) setDefaultWriteDeadline(ctx context.Context) bool {
 	if err := rc.SetWriteDeadline(rc.writeDeadline); err != nil {
-		if errors.Is(err, http.ErrNotSupported) {
-			panic(err)
-		}
-
-		if c := rc.hub.logger.Check(zap.InfoLevel, "Error while setting default write deadline"); c != nil {
-			c.Write(zap.Object("subscriber", rc.subscriber), zap.Error(err))
-		}
+		rc.hub.handleWriterError(ctx, err, "Error while setting default write deadline")
 
 		return false
 	}
@@ -59,15 +59,9 @@ func (rc *responseController) setDefaultWriteDeadline() bool {
 	return true
 }
 
-func (rc *responseController) flush() bool {
+func (rc *responseController) flush(ctx context.Context) bool {
 	if err := rc.Flush(); err != nil {
-		if errors.Is(err, http.ErrNotSupported) {
-			panic(err)
-		}
-
-		if c := rc.hub.logger.Check(zap.InfoLevel, "Unable to flush"); c != nil {
-			c.Write(zap.Object("subscriber", rc.subscriber), zap.Error(err))
-		}
+		rc.hub.handleWriterError(ctx, err, "Error while flushing response")
 
 		return false
 	}
@@ -78,7 +72,14 @@ func (rc *responseController) flush() bool {
 func (h *Hub) newResponseController(w http.ResponseWriter, s *LocalSubscriber) *responseController {
 	wd := h.getWriteDeadline(s)
 
-	return &responseController{*http.NewResponseController(w), w, wd.Add(-h.dispatchTimeout), wd, h, s} // nolint:bodyclose
+	return &responseController{
+		*http.NewResponseController(w), // nolint:bodyclose
+		w,
+		wd.Add(-h.dispatchTimeout),
+		wd,
+		h,
+		s,
+	}
 }
 
 func (h *Hub) getWriteDeadline(s *LocalSubscriber) (deadline time.Time) {
@@ -91,20 +92,25 @@ func (h *Hub) getWriteDeadline(s *LocalSubscriber) (deadline time.Time) {
 		deadline = now.Add(randomizeWriteDeadline(s.Claims.ExpiresAt.Sub(now)))
 	}
 
-	return
+	return deadline
 }
 
 // SubscribeHandler creates a keep alive connection and sends the events to the subscribers.
 //
 //nolint:funlen,gocognit
 func (h *Hub) SubscribeHandler(w http.ResponseWriter, r *http.Request) {
-	s, rc := h.registerSubscriber(w, r)
+	ctx := r.Context()
+
+	s, rc := h.registerSubscriber(ctx, w, r)
 	if s == nil {
 		return
 	}
-	defer h.shutdown(s)
 
-	rc.setDefaultWriteDeadline()
+	ctx = context.WithValue(ctx, SubscriberContextKey, &s.Subscriber)
+
+	defer h.shutdown(ctx, s)
+
+	rc.setDefaultWriteDeadline(ctx)
 
 	var (
 		heartbeatTimer      *time.Timer
@@ -126,17 +132,42 @@ func (h *Hub) SubscribeHandler(w http.ResponseWriter, r *http.Request) {
 		disconnectionTimerC = disconnectionTimer.C
 	}
 
+	debugLevel := rc.hub.logger.Enabled(ctx, slog.LevelDebug)
+
+	// On hub shutdown (Caddy "stopping" event, pod SIGTERM, …) we prefer to
+	// let each subscriber drain on its own per-connection write deadline
+	// (derived from writeTimeout, and optionally shortened by JWT expiry)
+	// rather than closing everything at once — that spreads the reconnect
+	// load at the same pace clients already experience in steady state,
+	// instead of producing a synchronized storm on the ingress and the
+	// transport. The orchestrator's grace period (k8s
+	// terminationGracePeriodSeconds, etc.) remains the hard deadline.
+	//
+	// When writeTimeout is disabled (0) there is no disconnectionTimerC, so
+	// the only way out on shutdown is still h.ctx.Done() — otherwise
+	// http.Server.Shutdown would hang indefinitely on active handlers.
+	var hubCtxDoneC <-chan struct{}
+	if h.writeTimeout == 0 {
+		hubCtxDoneC = h.ctx.Done()
+	}
+
 	for {
 		select {
-		case <-r.Context().Done():
-			if c := h.logger.Check(zap.DebugLevel, "Connection closed by the client"); c != nil {
-				c.Write(zap.Object("subscriber", s))
+		case <-hubCtxDoneC:
+			if debugLevel {
+				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Hub is shutting down, closing connection")
+			}
+
+			return
+		case <-ctx.Done():
+			if debugLevel {
+				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Connection closed by the client")
 			}
 
 			return
 		case <-heartbeatTimerC:
 			// Send an SSE comment as a heartbeat, to prevent issues with some proxies and old browsers
-			if !h.write(rc, ":\n") {
+			if !h.write(ctx, rc, ":\n") {
 				return
 			}
 
@@ -145,7 +176,7 @@ func (h *Hub) SubscribeHandler(w http.ResponseWriter, r *http.Request) {
 			// Cleanly close the HTTP connection before the write deadline to prevent client-side errors
 			return
 		case update, ok := <-s.Receive():
-			if !ok || !h.write(rc, newSerializedUpdate(update).event) {
+			if !ok || !h.write(ctx, rc, newSerializedUpdate(update).event) {
 				return
 			}
 
@@ -157,27 +188,29 @@ func (h *Hub) SubscribeHandler(w http.ResponseWriter, r *http.Request) {
 				heartbeatTimer.Reset(h.heartbeat)
 			}
 
-			if c := h.logger.Check(zap.DebugLevel, "Update sent"); c != nil {
-				c.Write(zap.Object("subscriber", s), zap.Object("update", update))
+			if debugLevel {
+				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Update sent", slog.Any("update", update))
 			}
 		}
 	}
 }
 
 // registerSubscriber initializes the connection.
-func (h *Hub) registerSubscriber(w http.ResponseWriter, r *http.Request) (*LocalSubscriber, *responseController) { //nolint:funlen
-	s := NewLocalSubscriber(retrieveLastEventID(r, h.opt, h.logger), h.logger, h.topicSelectorStore)
-	s.RemoteAddr = r.RemoteAddr
+func (h *Hub) registerSubscriber(ctx context.Context, w http.ResponseWriter, r *http.Request) (*LocalSubscriber, *responseController) { //nolint:funlen
+	ctx, span := startSpan(ctx, "mercure.subscribe", trace.WithSpanKind(trace.SpanKindConsumer))
+	defer span.End()
+
+	s := NewLocalSubscriber(h.retrieveLastEventID(ctx, r), h.logger, h.topicSelectorStore)
 
 	var (
 		privateTopics []string
 		claims        *claims
 	)
 
-	if h.subscriberJWTKeyFunc != nil {
+	if h.subscriberJWTKeyFunc != nil { //nolint:nestif
 		var err error
 
-		claims, err = authorize(r, h.subscriberJWTKeyFunc, nil, h.cookieName)
+		claims, err = h.authorize(r, false)
 		if claims != nil {
 			s.Claims = claims
 			privateTopics = claims.Mercure.Subscribe
@@ -186,8 +219,12 @@ func (h *Hub) registerSubscriber(w http.ResponseWriter, r *http.Request) (*Local
 		if err != nil || (claims == nil && !h.anonymous) {
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 
-			if c := h.logger.Check(zap.DebugLevel, "Subscriber unauthorized"); c != nil {
-				c.Write(zap.Object("subscriber", s), zap.Error(err))
+			if h.logger.Enabled(ctx, slog.LevelDebug) {
+				h.logger.LogAttrs(ctx, slog.LevelDebug, "Subscriber unauthorized", slog.Any("error", err))
+			}
+
+			if err != nil {
+				recordSpanError(span, err)
 			}
 
 			return nil, nil
@@ -201,32 +238,47 @@ func (h *Hub) registerSubscriber(w http.ResponseWriter, r *http.Request) (*Local
 		return nil, nil
 	}
 
-	s.SetTopics(topics, privateTopics)
-
-	h.dispatchSubscriptionUpdate(s, true)
-
-	if err := h.transport.AddSubscriber(s); err != nil {
-		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
-		h.dispatchSubscriptionUpdate(s, false)
-
-		if c := h.logger.Check(zap.ErrorLevel, "Unable to add subscriber"); c != nil {
-			c.Write(zap.Object("subscriber", s), zap.Error(err))
-		}
+	if len(topics) > maxQueryTopics {
+		http.Error(w, `Too many "topic" parameters.`, http.StatusBadRequest)
 
 		return nil, nil
 	}
 
-	h.sendHeaders(w, s)
-	rc := h.newResponseController(w, s)
-	rc.flush()
+	s.SetTopics(topics, privateTopics)
 
-	if c := h.logger.Check(zap.InfoLevel, "New subscriber"); c != nil {
-		fields := []LogField{zap.Object("subscriber", s)}
-		if claims != nil && h.logger.Level() == zap.DebugLevel {
-			fields = append(fields, zap.Reflect("payload", claims.Mercure.Payload))
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.String("mercure.subscriber.id", s.ID),
+			attribute.StringSlice("mercure.topics", topics),
+		)
+	}
+
+	addCtx := context.WithoutCancel(ctx)
+	h.dispatchSubscriptionUpdate(addCtx, s, true)
+
+	if err := h.transport.AddSubscriber(addCtx, s); err != nil {
+		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+		h.dispatchSubscriptionUpdate(addCtx, s, false)
+
+		if h.logger.Enabled(ctx, slog.LevelError) {
+			h.logger.LogAttrs(ctx, slog.LevelError, "Unable to add subscriber", slog.Any("error", err))
 		}
 
-		c.Write(fields...)
+		recordSpanError(span, err)
+
+		return nil, nil
+	}
+
+	h.sendHeaders(ctx, w, s)
+	rc := h.newResponseController(w, s)
+	rc.flush(ctx)
+
+	if h.logger.Enabled(ctx, slog.LevelInfo) {
+		if claims != nil && h.logger.Enabled(ctx, slog.LevelDebug) {
+			h.logger.LogAttrs(ctx, slog.LevelInfo, "New subscriber", slog.Any("payload", claims.Mercure.Payload))
+		} else {
+			h.logger.LogAttrs(ctx, slog.LevelInfo, "New subscriber")
+		}
 	}
 
 	h.metrics.SubscriberConnected(s)
@@ -234,37 +286,47 @@ func (h *Hub) registerSubscriber(w http.ResponseWriter, r *http.Request) (*Local
 	return s, rc
 }
 
-// sendHeaders sends correct HTTP headers to create a keep-alive connection.
-func (h *Hub) sendHeaders(w http.ResponseWriter, s *LocalSubscriber) {
-	// Keep alive, useful only for HTTP 1 clients https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Keep-Alive
-	w.Header().Set("Connection", "keep-alive")
+//nolint:gochecknoglobals
+var (
+	headerConnection   = []string{"keep-alive"}
+	headerContentType  = []string{"text/event-stream"}
+	headerCacheControl = []string{"private, no-cache, no-store, must-revalidate, max-age=0"}
+	headerPragma       = []string{"no-cache"}
+	headerExpire       = []string{"0"}
 
-	// Server-sent events https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Sending_events_from_the_server
-	w.Header().Set("Content-Type", "text/event-stream")
+	headerXAccelBuffering = []string{"no"}
+)
+
+// sendHeaders sends correct HTTP headers to create a keep-alive connection.
+func (h *Hub) sendHeaders(ctx context.Context, w http.ResponseWriter, s *LocalSubscriber) {
+	header := w.Header()
+
+	// Keep alive, useful only for HTTP 1 clients https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Keep-Alive
+	header["Connection"] = headerConnection
+
+	header["Content-Type"] = headerContentType
 
 	// Disable cache, even for old browsers and proxies
-	w.Header().Set("Cache-Control", "private, no-cache, no-store, must-revalidate, max-age=0")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expire", "0")
+	header["Cache-Control"] = headerCacheControl
+	header["Pragma"] = headerPragma
+	header["Expire"] = headerExpire
 
 	// NGINX support https://www.nginx.com/resources/wiki/start/topics/examples/x-accel/#x-accel-buffering
-	w.Header().Set("X-Accel-Buffering", "no")
+	header["X-Accel-Buffering"] = headerXAccelBuffering
 
 	if s.RequestLastEventID != "" {
-		w.Header().Set("Last-Event-ID", <-s.responseLastEventID)
+		header["Last-Event-Id"] = []string{<-s.responseLastEventID}
 	}
 
 	// Write a comment in the body
 	// Go currently doesn't provide a better way to flush the headers
-	if _, err := w.Write([]byte{':', '\n'}); err != nil {
-		if c := h.logger.Check(zap.WarnLevel, "Failed to write comment"); c != nil {
-			c.Write(zap.Object("subscriber", s), zap.Error(err))
-		}
+	if _, err := w.Write([]byte{':', '\n'}); err != nil && h.logger.Enabled(ctx, slog.LevelInfo) {
+		h.logger.LogAttrs(ctx, slog.LevelInfo, "Failed to write comment", slog.Any("error", err))
 	}
 }
 
 // retrieveLastEventID extracts the Last-Event-ID from the corresponding HTTP header with a fallback on the query parameter.
-func retrieveLastEventID(r *http.Request, opt *opt, logger Logger) string {
+func (h *Hub) retrieveLastEventID(ctx context.Context, r *http.Request) string {
 	if id := r.Header.Get("Last-Event-ID"); id != "" {
 		return id
 	}
@@ -274,15 +336,18 @@ func retrieveLastEventID(r *http.Request, opt *opt, logger Logger) string {
 		return id
 	}
 
-	if legacyEventIDValues, present := query["Last-Event-ID"]; present {
-		if opt.isBackwardCompatiblyEnabledWith(7) {
-			logger.Info("Deprecated: the 'Last-Event-ID' query parameter is deprecated since the version 8 of the protocol, use 'lastEventID' instead.")
+	if legacyEventIDValues, present := query["Last-Event-ID"]; present { //nolint:nestif
+		infoLevel := h.logger.Enabled(ctx, slog.LevelInfo)
+		if h.isBackwardCompatiblyEnabledWith(7) {
+			if infoLevel {
+				h.logger.LogAttrs(ctx, slog.LevelInfo, "Deprecated: the 'Last-Event-ID' query parameter is deprecated since the version 8 of the protocol, use 'lastEventID' instead.")
+			}
 
 			if len(legacyEventIDValues) != 0 {
 				return legacyEventIDValues[0]
 			}
-		} else {
-			logger.Info("Unsupported: the 'Last-Event-ID' query parameter is not supported anymore, use 'lastEventID' instead or enable backward compatibility with version 7 of the protocol.")
+		} else if infoLevel {
+			h.logger.LogAttrs(ctx, slog.LevelInfo, `Unsupported: the "Last-Event-ID"" query parameter is not supported anymore, use "lastEventID"" instead or enable backward compatibility with version 7 of the protocol.`)
 		}
 	}
 
@@ -291,42 +356,40 @@ func retrieveLastEventID(r *http.Request, opt *opt, logger Logger) string {
 
 // Write sends the given string to the client.
 // It returns false if the subscriber has been disconnected (e.g. timeout).
-func (h *Hub) write(rc *responseController, data string) bool {
-	if !rc.setDispatchWriteDeadline() {
+func (h *Hub) write(ctx context.Context, rc *responseController, data string) bool {
+	if !rc.setDispatchWriteDeadline(ctx) {
 		return false
 	}
 
-	if _, err := rc.rw.Write([]byte(data)); err != nil {
-		if c := h.logger.Check(zap.DebugLevel, "Error writing to client"); c != nil {
-			c.Write(zap.Object("subscriber", rc.subscriber), zap.Error(err))
-		}
+	if _, err := rc.rw.Write([]byte(data)); err != nil && h.logger.Enabled(ctx, slog.LevelDebug) {
+		h.logger.LogAttrs(ctx, slog.LevelDebug, "Failed to write comment", slog.Any("error", err))
 
 		return false
 	}
 
-	return rc.flush() && rc.setDefaultWriteDeadline()
+	return rc.flush(ctx) && rc.setDefaultWriteDeadline(ctx)
 }
 
-func (h *Hub) shutdown(s *LocalSubscriber) {
+func (h *Hub) shutdown(ctx context.Context, s *LocalSubscriber) {
 	// Notify that the client is closing the connection
 	s.Disconnect()
 
-	if err := h.transport.RemoveSubscriber(s); err != nil {
-		if c := h.logger.Check(zap.WarnLevel, "Failed to remove subscriber on shutdown"); c != nil {
-			c.Write(zap.Object("subscriber", s), zap.Error(err))
-		}
+	ctx = context.WithoutCancel(ctx)
+
+	if err := h.transport.RemoveSubscriber(ctx, s); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
+		h.logger.LogAttrs(ctx, slog.LevelError, "Failed to remove subscriber on shutdown", slog.Any("error", err))
 	}
 
-	h.dispatchSubscriptionUpdate(s, false)
+	h.dispatchSubscriptionUpdate(ctx, s, false)
 
-	if c := h.logger.Check(zap.InfoLevel, "Subscriber disconnected"); c != nil {
-		c.Write(zap.Object("subscriber", s))
+	if h.logger.Enabled(ctx, slog.LevelInfo) {
+		h.logger.LogAttrs(ctx, slog.LevelInfo, "Subscriber disconnected")
 	}
 
 	h.metrics.SubscriberDisconnected(s)
 }
 
-func (h *Hub) dispatchSubscriptionUpdate(s *LocalSubscriber, active bool) {
+func (h *Hub) dispatchSubscriptionUpdate(ctx context.Context, s *LocalSubscriber, active bool) {
 	if !h.subscriptions {
 		return
 	}
@@ -343,10 +406,9 @@ func (h *Hub) dispatchSubscriptionUpdate(s *LocalSubscriber, active bool) {
 			Debug:   h.debug,
 			Event:   Event{Data: string(j)},
 		}
-		if err := h.transport.Dispatch(u); err != nil {
-			if c := h.logger.Check(zap.WarnLevel, "Failed to dispatch update"); c != nil {
-				c.Write(zap.Object("subscriber", s), zap.Object("update", u), zap.Error(err))
-			}
+
+		if err := h.transport.Dispatch(ctx, u); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
+			h.logger.LogAttrs(ctx, slog.LevelError, "Failed to dispatch update", slog.Any("update", u), slog.Any("subscription", subscription.ID), slog.Any("error", err))
 		}
 	}
 }
@@ -377,4 +439,14 @@ func randomizeWriteDeadline(originalValue time.Duration) time.Duration {
 	// rand.Int64n(n) returns a non-negative pseudo-random 64-bit integer in the half-open interval [0, n).
 	// Adding 'min' shifts this result to the desired range [min, max].
 	return time.Duration(rand.Int64N(rangeSize) + minV) //nolint:gosec
+}
+
+func (h *Hub) handleWriterError(ctx context.Context, err error, message string) {
+	if errors.Is(err, http.ErrNotSupported) {
+		panic(err)
+	}
+
+	if h.logger.Enabled(ctx, slog.LevelInfo) {
+		h.logger.LogAttrs(ctx, slog.LevelInfo, message, slog.Any("error", err))
+	}
 }

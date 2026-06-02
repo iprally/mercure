@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 
 	"github.com/redis/go-redis/v9"
-	"go.uber.org/zap"
 	"golang.org/x/oauth2/google"
 )
 
@@ -30,7 +30,7 @@ var errAuthFailed = errors.New("AUTH failed")
 type RedisTransport struct {
 	sync.RWMutex
 
-	logger           Logger
+	logger           *slog.Logger
 	client           *redis.Client
 	subscribers      *SubscriberList
 	closed           chan any
@@ -57,7 +57,7 @@ type RedisConfig struct {
 }
 
 func NewRedisTransport(
-	logger Logger,
+	logger *slog.Logger,
 	address string,
 	username string,
 	password string,
@@ -80,7 +80,7 @@ func NewRedisTransport(
 
 // NewRedisTransportWithIAM creates a Redis transport with IAM authentication for Google Cloud Memorystore.
 func NewRedisTransportWithIAM(
-	logger Logger,
+	logger *slog.Logger,
 	projectID string,
 	location string,
 	instanceID string,
@@ -107,7 +107,7 @@ func NewRedisTransportWithIAM(
 
 // NewRedisTransportWithIAMAddress creates a Redis transport with IAM authentication using the full Memorystore address.
 func NewRedisTransportWithIAMAddress(
-	logger Logger,
+	logger *slog.Logger,
 	address string,
 	projectID string,
 	subscribersSize int,
@@ -127,7 +127,12 @@ func NewRedisTransportWithIAMAddress(
 }
 
 // NewRedisTransportWithConfig creates a Redis transport with the given configuration.
-func NewRedisTransportWithConfig(logger Logger, config *RedisConfig) (*RedisTransport, error) {
+func NewRedisTransportWithConfig(logger *slog.Logger, config *RedisConfig) (*RedisTransport, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	ctx := context.Background()
 	var client *redis.Client
 
 	var err error
@@ -147,15 +152,16 @@ func NewRedisTransportWithConfig(logger Logger, config *RedisConfig) (*RedisTran
 		})
 	}
 
-	if pong := client.Ping(context.Background()); pong.String() != "ping: PONG" {
+	if pong := client.Ping(ctx); pong.String() != "ping: PONG" {
 		return nil, fmt.Errorf("failed to connect to Redis: %w", pong.Err())
 	}
 
-	// Log successful Redis connection
-	logger.Info("Redis connection established",
-		zap.String("address", config.Address),
-		zap.Bool("useIAM", config.UseIAMAuth),
-	)
+	if logger.Enabled(ctx, slog.LevelInfo) {
+		logger.LogAttrs(ctx, slog.LevelInfo, "Redis connection established",
+			slog.String("address", config.Address),
+			slog.Bool("useIAM", config.UseIAMAuth),
+		)
+	}
 
 	return NewRedisTransportInstance(logger, client, config.SubscribersSize, config.RedisChannel, config.HistorySize)
 }
@@ -223,12 +229,16 @@ func createRedisClientWithIAM(config *RedisConfig) (*redis.Client, error) {
 }
 
 func NewRedisTransportInstance(
-	logger Logger,
+	logger *slog.Logger,
 	client *redis.Client,
 	subscribersSize int,
 	redisChannel string,
 	historySize int,
 ) (*RedisTransport, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	if historySize <= 0 {
 		historySize = defaultHistorySize
 	}
@@ -251,20 +261,21 @@ func NewRedisTransportInstance(
 	go func() {
 		select {
 		case <-transport.closed:
-			if err := subscriber.Close(); err != nil && !errors.Is(err, redis.ErrClosed) {
-				logger.Error(err.Error())
+			if err := subscriber.Close(); err != nil && !errors.Is(err, redis.ErrClosed) && logger.Enabled(subscribeCtx, slog.LevelError) {
+				logger.LogAttrs(subscribeCtx, slog.LevelError, err.Error())
 			}
 
 			<-subscribeCtx.Done()
 
-			if err := client.Close(); err != nil && !errors.Is(err, redis.ErrClosed) {
-				logger.Error(err.Error())
+			if err := client.Close(); err != nil && !errors.Is(err, redis.ErrClosed) && logger.Enabled(context.Background(), slog.LevelError) {
+				logger.LogAttrs(context.Background(), slog.LevelError, err.Error())
 			}
 
-			// Log Redis connection closure
-			logger.Info("Redis connection closed",
-				zap.String("address", transport.client.Options().Addr),
-			)
+			if logger.Enabled(context.Background(), slog.LevelInfo) {
+				logger.LogAttrs(context.Background(), slog.LevelInfo, "Redis connection closed",
+					slog.String("address", transport.client.Options().Addr),
+				)
+			}
 		case <-subscribeCtx.Done():
 		}
 	}()
@@ -291,19 +302,19 @@ func (u Update) MarshalBinary() ([]byte, error) {
 	return bytes, nil
 }
 
-func (t *RedisTransport) Dispatch(update *Update) error {
+func (t *RedisTransport) Dispatch(ctx context.Context, update *Update) error {
 	select {
 	case <-t.closed:
 		return ErrClosedTransport
 	default:
 	}
 
-	AssignUUID(update)
+	update.AssignUUID()
 
 	keys := []string{lastEventIDKey, t.historyStreamKey}
 	arguments := []interface{}{update.ID, t.redisChannel, update, t.historySize}
 
-	_, err := t.publishScript.Run(context.Background(), t.client, keys, arguments...).Result()
+	_, err := t.publishScript.Run(ctx, t.client, keys, arguments...).Result()
 	if err != nil {
 		return fmt.Errorf("redis failed to publish: %w", err)
 	}
@@ -311,7 +322,7 @@ func (t *RedisTransport) Dispatch(update *Update) error {
 	return nil
 }
 
-func (t *RedisTransport) AddSubscriber(s *LocalSubscriber) error {
+func (t *RedisTransport) AddSubscriber(ctx context.Context, s *LocalSubscriber) error {
 	select {
 	case <-t.closed:
 		return ErrClosedTransport
@@ -323,15 +334,15 @@ func (t *RedisTransport) AddSubscriber(s *LocalSubscriber) error {
 	t.Unlock()
 
 	if s.RequestLastEventID != "" {
-		t.dispatchHistory(s)
+		t.dispatchHistory(ctx, s)
 	}
 
-	s.Ready()
+	s.Ready(ctx)
 
 	return nil
 }
 
-func (t *RedisTransport) RemoveSubscriber(s *LocalSubscriber) error {
+func (t *RedisTransport) RemoveSubscriber(_ context.Context, s *LocalSubscriber) error {
 	select {
 	case <-t.closed:
 		return ErrClosedTransport
@@ -346,7 +357,7 @@ func (t *RedisTransport) RemoveSubscriber(s *LocalSubscriber) error {
 	return nil
 }
 
-func (t *RedisTransport) GetSubscribers() (string, []*Subscriber, error) {
+func (t *RedisTransport) GetSubscribers(ctx context.Context) (string, []*Subscriber, error) {
 	select {
 	case <-t.closed:
 		return "", nil, ErrClosedTransport
@@ -356,23 +367,26 @@ func (t *RedisTransport) GetSubscribers() (string, []*Subscriber, error) {
 	t.RLock()
 	defer t.RUnlock()
 
-	lastEventID, err := t.client.Get(context.Background(), lastEventIDKey).Result()
-	if err != nil {
+	lastEventID, err := t.client.Get(ctx, lastEventIDKey).Result()
+	if errors.Is(err, redis.Nil) {
+		lastEventID = EarliestLastEventID
+	} else if err != nil {
 		return "", nil, fmt.Errorf("redis failed to get last event id: %w", err)
 	}
 
 	return lastEventID, getSubscribers(t.subscribers), nil
 }
 
-func (t *RedisTransport) Close() (err error) {
+func (t *RedisTransport) Close(ctx context.Context) (err error) {
 	t.closedOnce.Do(func() {
 		t.Lock()
 		defer t.Unlock()
 
-		// Log transport shutdown
-		t.logger.Info("Redis transport shutting down",
-			zap.String("address", t.client.Options().Addr),
-		)
+		if t.logger.Enabled(ctx, slog.LevelInfo) {
+			t.logger.LogAttrs(ctx, slog.LevelInfo, "Redis transport shutting down",
+				slog.String("address", t.client.Options().Addr),
+			)
+		}
 
 		t.subscribers.Walk(0, func(s *LocalSubscriber) bool {
 			s.Disconnect()
@@ -386,10 +400,10 @@ func (t *RedisTransport) Close() (err error) {
 	return nil
 }
 
-func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
-	entries, err := t.client.XRange(context.Background(), t.historyStreamKey, "-", "+").Result()
+func (t *RedisTransport) dispatchHistory(ctx context.Context, s *LocalSubscriber) {
+	entries, err := t.client.XRange(ctx, t.historyStreamKey, "-", "+").Result()
 	if err != nil {
-		t.logger.Error("failed to read history stream", zap.Error(err))
+		t.logger.LogAttrs(ctx, slog.LevelError, "failed to read history stream", slog.Any("error", err))
 		s.HistoryDispatched(EarliestLastEventID)
 
 		return
@@ -417,13 +431,13 @@ func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
 
 		var update Update
 		if err := json.Unmarshal([]byte(payload), &update); err != nil {
-			t.logger.Error("failed to unmarshal history entry", zap.Error(err))
+			t.logger.LogAttrs(ctx, slog.LevelError, "failed to unmarshal history entry", slog.Any("error", err))
 
 			continue
 		}
 
 		if s.Match(&update) {
-			if !s.Dispatch(&update, true) {
+			if !s.Dispatch(ctx, &update, true) {
 				s.HistoryDispatched(responseLastEventID)
 
 				return
@@ -435,10 +449,8 @@ func (t *RedisTransport) dispatchHistory(s *LocalSubscriber) {
 
 	s.HistoryDispatched(responseLastEventID)
 
-	if !afterLastEventID {
-		if c := t.logger.Check(zap.DebugLevel, "Can't find requested LastEventID"); c != nil {
-			c.Write(zap.String("LastEventID", s.RequestLastEventID))
-		}
+	if !afterLastEventID && t.logger.Enabled(ctx, slog.LevelDebug) {
+		t.logger.LogAttrs(ctx, slog.LevelDebug, "Can't find requested LastEventID", slog.String("LastEventID", s.RequestLastEventID))
 	}
 }
 
@@ -452,7 +464,7 @@ func (t *RedisTransport) subscribe(ctx context.Context, cancel context.CancelFun
 				return
 			}
 
-			t.logger.Error(err.Error())
+			t.logger.LogAttrs(ctx, slog.LevelError, err.Error())
 
 			continue
 		}
@@ -460,7 +472,7 @@ func (t *RedisTransport) subscribe(ctx context.Context, cancel context.CancelFun
 		var update Update
 
 		if err := json.Unmarshal([]byte(message.Payload), &update); err != nil {
-			t.logger.Error(err.Error())
+			t.logger.LogAttrs(ctx, slog.LevelError, err.Error())
 
 			continue
 		}
@@ -472,7 +484,7 @@ func (t *RedisTransport) subscribe(ctx context.Context, cancel context.CancelFun
 
 		for _, subscriber := range t.subscribers.MatchAny(&update) {
 			update.Topics = topics
-			subscriber.Dispatch(&update, false)
+			subscriber.Dispatch(ctx, &update, false)
 		}
 
 		t.Unlock()

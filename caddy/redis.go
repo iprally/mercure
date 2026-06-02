@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"log/slog"
 	"strconv"
 
 	"github.com/caddyserver/caddy/v2"
@@ -23,8 +24,8 @@ type Redis struct {
 	RedisChannel    string `json:"redis_channel,omitempty"`
 	HistorySize     int    `json:"history_size,omitempty"`
 	// IAM authentication for Google Cloud Memorystore
-	UseIAMAuth      bool   `json:"use_iam_auth,omitempty"`
-	ProjectID       string `json:"project_id,omitempty"`
+	UseIAMAuth bool   `json:"use_iam_auth,omitempty"`
+	ProjectID  string `json:"project_id,omitempty"`
 
 	transport    *mercure.RedisTransport
 	transportKey string
@@ -50,6 +51,8 @@ func (r *Redis) Provision(ctx caddy.Context) error {
 	}
 	r.transportKey = key.String()
 
+	logger := slog.New(mercure.NewSlogHandler(ctx.Slogger().Handler()))
+
 	destructor, _, err := TransportUsagePool.LoadOrNew(r.transportKey, func() (caddy.Destructor, error) {
 		var t *mercure.RedisTransport
 		var err error
@@ -59,10 +62,10 @@ func (r *Redis) Provision(ctx caddy.Context) error {
 			if r.ProjectID == "" {
 				return nil, fmt.Errorf("project_id is required when using IAM authentication")
 			}
-			t, err = mercure.NewRedisTransportWithIAMAddress(ctx.Logger(), r.Address, r.ProjectID, r.SubscribersSize, r.RedisChannel, r.HistorySize)
+			t, err = mercure.NewRedisTransportWithIAMAddress(logger, r.Address, r.ProjectID, r.SubscribersSize, r.RedisChannel, r.HistorySize)
 		} else {
 			// Use traditional authentication
-			t, err = mercure.NewRedisTransport(ctx.Logger(), r.Address, r.Username, r.Password, r.SubscribersSize, r.RedisChannel, r.HistorySize)
+			t, err = mercure.NewRedisTransport(logger, r.Address, r.Username, r.Password, r.SubscribersSize, r.RedisChannel, r.HistorySize)
 		}
 
 		if err != nil {

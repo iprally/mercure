@@ -1,9 +1,13 @@
+//go:build deprecated_server
+
 package mercure
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -11,8 +15,9 @@ import (
 
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
-	"go.uber.org/zap"
 )
+
+const hs256 = "HS256"
 
 // ErrInvalidConfig is returned when the configuration is invalid.
 //
@@ -25,7 +30,7 @@ var ErrInvalidConfig = errors.New("invalid config")
 func SetConfigDefaults(v *viper.Viper) {
 	v.SetDefault("debug", false)
 	v.SetDefault("transport_url", "bolt://updates.db")
-	v.SetDefault("jwt_algorithm", "HS256")
+	v.SetDefault("jwt_algorithm", hs256)
 	v.SetDefault("allow_anonymous", false)
 	v.SetDefault("acme_http01_addr", ":http")
 	v.SetDefault("heartbeat_interval", 40*time.Second) // Must be < 45s for compatibility with Yaffle/EventSource
@@ -101,13 +106,13 @@ func SetFlags(fs *pflag.FlagSet, v *viper.Viper) {
 	fs.BoolP("use-forwarded-headers", "f", false, "enable headers forwarding")
 	fs.BoolP("demo", "D", false, "enable the demo mode")
 	fs.BoolP("subscriptions", "s", false, "dispatch updates when subscriptions are created or terminated")
-	fs.Int("tcsz", DefaultTopicSelectorStoreLRUMaxEntriesPerShard, "size of each shard in topic selector store cache")
+	fs.Int("tcsz", DefaultTopicSelectorStoreCacheSize, "size of the topic selector store cache")
 
 	fs.Bool("metrics-enabled", false, "enable metrics")
 	fs.String("metrics-addr", "127.0.0.1:9764", "metrics HTTP server address")
 
 	fs.VisitAll(func(f *pflag.Flag) {
-		v.BindPFlag(strings.ReplaceAll(f.Name, "-", "_"), fs.Lookup(f.Name))
+		_ = v.BindPFlag(strings.ReplaceAll(f.Name, "-", "_"), fs.Lookup(f.Name))
 	})
 }
 
@@ -130,7 +135,7 @@ func InitConfig(v *viper.Viper) {
 	v.AddConfigPath(configDir + "/mercure/")
 	v.AddConfigPath("/etc/mercure/")
 
-	v.ReadInConfig()
+	_ = v.ReadInConfig()
 }
 
 // NewHubFromViper creates a new Hub from the Viper config.
@@ -141,33 +146,28 @@ func NewHubFromViper(v *viper.Viper) (*Hub, error) { //nolint:funlen,gocognit
 		log.Panic(err)
 	}
 
-	options := []Option{}
-
 	var (
-		logger Logger
-		err    error
-		k      string
+		err        error
+		k          string
+		options    []Option
+		loggerOpts *slog.HandlerOptions
 	)
 
 	if v.GetBool("debug") {
 		options = append(options, WithDebug())
-		logger, err = zap.NewDevelopment()
-	} else {
-		logger, err = zap.NewProduction()
+		loggerOpts = &slog.HandlerOptions{Level: slog.LevelDebug}
 	}
 
-	if err != nil {
-		return nil, fmt.Errorf("unable to create logger: %w", err)
-	}
+	options = append(options, WithLogger(slog.New(mercureHandler{slog.NewTextHandler(os.Stderr, loggerOpts)})))
 
 	var tss *TopicSelectorStore
 
 	tcsz := v.GetInt("tcsz")
 	if tcsz == 0 {
-		tcsz = DefaultTopicSelectorStoreLRUMaxEntriesPerShard
+		tcsz = DefaultTopicSelectorStoreCacheSize
 	}
 
-	tss, err = NewTopicSelectorStoreLRU(tcsz, DefaultTopicSelectorStoreLRUShardCount)
+	tss, err = NewTopicSelectorStore(tcsz)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +178,7 @@ func NewHubFromViper(v *viper.Viper) (*Hub, error) { //nolint:funlen,gocognit
 			return nil, fmt.Errorf("invalid transport url: %w", err)
 		}
 
-		t, err := NewTransport(u, logger)
+		t, err := NewTransport(u, slog.Default())
 		if err != nil {
 			return nil, err
 		}
@@ -190,7 +190,7 @@ func NewHubFromViper(v *viper.Viper) (*Hub, error) { //nolint:funlen,gocognit
 		options = append(options, WithMetrics(NewPrometheusMetrics(nil)))
 	}
 
-	options = append(options, WithLogger(logger), WithTopicSelectorStore(tss))
+	options = append(options, WithTopicSelectorStore(tss))
 	if v.GetBool("allow_anonymous") {
 		options = append(options, WithAnonymous())
 	}
@@ -223,7 +223,7 @@ func NewHubFromViper(v *viper.Viper) (*Hub, error) { //nolint:funlen,gocognit
 		alg := v.GetString("publisher_jwt_algorithm")
 		if alg == "" {
 			if alg = v.GetString("jwt_algorithm"); alg == "" {
-				alg = "HS256"
+				alg = hs256
 			}
 		}
 
@@ -238,7 +238,7 @@ func NewHubFromViper(v *viper.Viper) (*Hub, error) { //nolint:funlen,gocognit
 		alg := v.GetString("subscriber_jwt_algorithm")
 		if alg == "" {
 			if alg = v.GetString("jwt_algorithm"); alg == "" {
-				alg = "HS256"
+				alg = hs256
 			}
 		}
 
@@ -257,7 +257,7 @@ func NewHubFromViper(v *viper.Viper) (*Hub, error) { //nolint:funlen,gocognit
 		options = append(options, WithCORSOrigins(o))
 	}
 
-	h, err := NewHub(options...)
+	h, err := NewHub(context.Background(), options...)
 	if err != nil {
 		return nil, err
 	}
@@ -276,11 +276,13 @@ func Start() {
 		log.Fatalln(err)
 	}
 
+	ctx := context.Background()
+
 	defer func() {
-		if err := h.transport.Close(); err != nil {
+		if err := h.transport.Close(ctx); err != nil {
 			log.Fatalln(err)
 		}
 	}()
 
-	h.Serve()
+	h.Serve(ctx)
 }

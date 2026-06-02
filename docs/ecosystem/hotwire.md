@@ -3,9 +3,9 @@
 > [Hotwire](https://hotwire.dev) is an alternative approach to building modern web applications without using much JavaScript by sending HTML instead of JSON over the wire.
 
 Hotwire comes with a handy feature called [Turbo Streams](https://turbo.hotwire.dev/handbook/streams).
-Turbo Streams allow servers to push page changes to connected clients in real-time.
+Turbo Streams allow servers to push page changes to connected clients in real time.
 
-Using Mercure to power a Turbo Stream is straightforward, and doesn't require any external dependency:
+Using Mercure to power a Turbo Stream is straightforward and doesn't require any external dependency:
 
 ```javascript
 import { connectStreamSource } from "@hotwired/turbo";
@@ -38,7 +38,7 @@ curl \
 
 [Other Mercure features](../../spec/mercure.md#publication), including broadcasting private updates to authorized subscribers, are also supported.
 
-In this example, we use `curl` but any HTTP client or [Mercure client library](awesome.md#client-libraries) will work.
+In this example, we use cURL but any HTTP client or [Mercure client library](awesome.md#client-libraries) will work.
 
 ## Disconnecting From a Stream
 

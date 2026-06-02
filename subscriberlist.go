@@ -4,11 +4,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/kevburnsjr/skipfilter"
+	"github.com/dunglas/skipfilter"
 )
 
 type SubscriberList struct {
-	skipfilter *skipfilter.SkipFilter
+	skipfilter *skipfilter.SkipFilter[*LocalSubscriber, string]
 }
 
 // We choose a delimiter and an escape character which are unlikely to be used.
@@ -23,11 +23,17 @@ var replacer = strings.NewReplacer(
 	string(delim), string([]rune{escape, delim}),
 )
 
-func NewSubscriberList(size int) *SubscriberList {
+// DefaultSubscriberListCacheSize is the default size of the skipfilter cache.
+//
+// Let's say update topics take 100 bytes on average, a cache with
+// 100,000 entries will use about 10MB.
+const DefaultSubscriberListCacheSize = 100_000
+
+func NewSubscriberList(cacheSize int) *SubscriberList {
 	return &SubscriberList{
-		skipfilter: skipfilter.New(func(s interface{}, filter interface{}) bool {
-			return s.(*LocalSubscriber).MatchTopics(decode(filter.(string)))
-		}, size),
+		skipfilter: skipfilter.New[*LocalSubscriber, string](func(s *LocalSubscriber, filter string) bool {
+			return s.MatchTopics(decode(filter))
+		}, cacheSize),
 	}
 }
 
@@ -90,17 +96,13 @@ func decode(f string) (topics []string, private bool) {
 	return topics, private
 }
 
-func (sl *SubscriberList) MatchAny(u *Update) (res []*LocalSubscriber) {
-	for _, m := range sl.skipfilter.MatchAny(encode(u.Topics, u.Private)) {
-		res = append(res, m.(*LocalSubscriber))
-	}
-
-	return
+func (sl *SubscriberList) MatchAny(u *Update) []*LocalSubscriber {
+	return sl.skipfilter.MatchAny(encode(u.Topics, u.Private))
 }
 
 func (sl *SubscriberList) Walk(start uint64, callback func(s *LocalSubscriber) bool) uint64 {
-	return sl.skipfilter.Walk(start, func(val interface{}) bool {
-		return callback(val.(*LocalSubscriber))
+	return sl.skipfilter.Walk(start, func(val *LocalSubscriber) bool {
+		return callback(val)
 	})
 }
 

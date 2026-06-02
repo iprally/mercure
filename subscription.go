@@ -2,24 +2,33 @@ package mercure
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/url"
 
 	"github.com/gorilla/mux"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/otel/trace"
 )
 
-const jsonldContext = "https://mercure.rocks/"
+const (
+	jsonldContext            = "https://mercure.rocks/"
+	subscriptionsPath        = "/subscriptions"
+	subscriptionURL          = defaultHubURL + subscriptionsPath + "/{topic}/{subscriber}"
+	subscriptionsForTopicURL = defaultHubURL + subscriptionsPath + "/{topic}"
+	subscriptionsURL         = defaultHubURL + subscriptionsPath
+)
+
+var jsonldContentType = []string{"application/ld+json"} // nolint:gochecknoglobals
 
 type subscription struct {
-	Context     string      `json:"@context,omitempty"`
-	ID          string      `json:"id"`
-	Type        string      `json:"type"`
-	Subscriber  string      `json:"subscriber"`
-	Topic       string      `json:"topic"`
-	Active      bool        `json:"active"`
-	LastEventID string      `json:"lastEventID,omitempty"`
-	Payload     interface{} `json:"payload,omitempty"`
+	Context     string `json:"@context,omitempty"`
+	ID          string `json:"id"`
+	Type        string `json:"type"`
+	Subscriber  string `json:"subscriber"`
+	Topic       string `json:"topic"`
+	Active      bool   `json:"active"`
+	LastEventID string `json:"lastEventID,omitempty"`
+	Payload     any    `json:"payload,omitempty"`
 }
 
 type subscriptionCollection struct {
@@ -30,17 +39,10 @@ type subscriptionCollection struct {
 	Subscriptions []subscription `json:"subscriptions"`
 }
 
-const (
-	subscriptionsPath        = "/subscriptions"
-	subscriptionURL          = defaultHubURL + subscriptionsPath + "/{topic}/{subscriber}"
-	subscriptionsForTopicURL = defaultHubURL + subscriptionsPath + "/{topic}"
-	subscriptionsURL         = defaultHubURL + subscriptionsPath
-)
-
 func (h *Hub) SubscriptionsHandler(w http.ResponseWriter, r *http.Request) {
-	currentURL := r.URL.RequestURI()
+	span, currentURL, lastEventID, subscribers, ok := h.initSubscription(w, r)
+	defer span.End()
 
-	lastEventID, subscribers, ok := h.initSubscription(currentURL, w, r)
 	if !ok {
 		return
 	}
@@ -64,24 +66,28 @@ func (h *Hub) SubscriptionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	j, err := json.MarshalIndent(subscriptionCollection, "", "  ")
 	if err != nil {
+		// Can't happen
 		panic(err)
 	}
 
 	if _, err := w.Write(j); err != nil {
-		if c := h.logger.Check(zap.WarnLevel, "Failed to write subscriptions response"); c != nil {
-			c.Write(zap.Error(err))
+		ctx := r.Context()
+
+		if h.logger.Enabled(ctx, slog.LevelInfo) {
+			h.logger.LogAttrs(ctx, slog.LevelInfo, "Failed to write subscriptions response", slog.Any("error", err))
 		}
 	}
 }
 
 func (h *Hub) SubscriptionHandler(w http.ResponseWriter, r *http.Request) {
-	currentURL := r.URL.RequestURI()
+	span, _, lastEventID, subscribers, ok := h.initSubscription(w, r)
+	defer span.End()
 
-	lastEventID, subscribers, ok := h.initSubscription(currentURL, w, r)
 	if !ok {
 		return
 	}
 
+	ctx := r.Context()
 	vars := mux.Vars(r)
 	s, _ := url.QueryUnescape(vars["subscriber"])
 	t, _ := url.QueryUnescape(vars["topic"])
@@ -103,26 +109,31 @@ func (h *Hub) SubscriptionHandler(w http.ResponseWriter, r *http.Request) {
 				panic(err)
 			}
 
-			if _, err := w.Write(j); err != nil {
-				if c := h.logger.Check(zap.WarnLevel, "Failed to write subscription response"); c != nil {
-					c.Write(zap.Error(err), zap.Object("subscriber", subscriber), zap.String("remote_addr", r.RemoteAddr))
-				}
+			if _, err := w.Write(j); err != nil && h.logger.Enabled(ctx, slog.LevelInfo) { //nolint:gosec
+				h.logger.LogAttrs(ctx, slog.LevelInfo, "Failed to write subscription response", slog.Any("subscriber", subscriber), slog.Any("error", err))
 			}
 
 			return
 		}
 	}
 
-	w.WriteHeader(http.StatusNotFound)
+	http.NotFound(w, r)
 }
 
-func (h *Hub) initSubscription(currentURL string, w http.ResponseWriter, r *http.Request) (lastEventID string, subscribers []*Subscriber, ok bool) {
+func (h *Hub) initSubscription(w http.ResponseWriter, r *http.Request) (span trace.Span, currentURL, lastEventID string, subscribers []*Subscriber, ok bool) {
+	ctx, span := startSpan(r.Context(), "mercure.subscriptions", trace.WithSpanKind(trace.SpanKindInternal))
+	currentURL = r.URL.RequestURI()
+
 	if h.subscriberJWTKeyFunc != nil {
-		claims, err := authorize(r, h.subscriberJWTKeyFunc, nil, h.cookieName)
+		claims, err := h.authorize(r, false)
 		if err != nil || claims == nil || claims.Mercure.Subscribe == nil || !canReceive(h.topicSelectorStore, []string{currentURL}, claims.Mercure.Subscribe) {
 			h.httpAuthorizationError(w, r, err)
 
-			return "", nil, false
+			if err != nil {
+				recordSpanError(span, err)
+			}
+
+			return span, "", "", nil, false
 		}
 	}
 
@@ -133,25 +144,28 @@ func (h *Hub) initSubscription(currentURL string, w http.ResponseWriter, r *http
 
 	var err error
 
-	lastEventID, subscribers, err = transport.GetSubscribers()
+	lastEventID, subscribers, err = transport.GetSubscribers(ctx)
 	if err != nil {
-		if c := h.logger.Check(zap.ErrorLevel, "Error retrieving subscribers"); c != nil {
-			c.Write(zap.Error(err))
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
+		if h.logger.Enabled(ctx, slog.LevelError) {
+			h.logger.LogAttrs(ctx, slog.LevelError, "Error retrieving subscribers", slog.Any("error", err))
 		}
 
-		w.WriteHeader(http.StatusInternalServerError)
+		recordSpanError(span, err)
 
-		return lastEventID, subscribers, ok
+		return span, currentURL, lastEventID, subscribers, false
 	}
 
 	if r.Header.Get("If-None-Match") == lastEventID {
 		w.WriteHeader(http.StatusNotModified)
 
-		return "", nil, false
+		return span, "", "", nil, false
 	}
 
-	w.Header().Add("Content-Type", "application/ld+json")
-	w.Header().Add("ETag", lastEventID)
+	header := w.Header()
+	header["Content-Type"] = jsonldContentType
+	header["ETag"] = []string{lastEventID}
 
-	return lastEventID, subscribers, true
+	return span, currentURL, lastEventID, subscribers, true
 }

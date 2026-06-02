@@ -3,6 +3,7 @@ package caddy
 import (
 	"bytes"
 	"encoding/gob"
+	"path/filepath"
 	"strconv"
 
 	"github.com/caddyserver/caddy/v2"
@@ -11,7 +12,7 @@ import (
 )
 
 func init() { //nolint:gochecknoinits
-	caddy.RegisterModule(Bolt{})
+	caddy.RegisterModule(&Bolt{})
 }
 
 type Bolt struct {
@@ -25,7 +26,7 @@ type Bolt struct {
 }
 
 // CaddyModule returns the Caddy module information.
-func (Bolt) CaddyModule() caddy.ModuleInfo {
+func (*Bolt) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.mercure.bolt",
 		New: func() caddy.Module { return new(Bolt) },
@@ -40,14 +41,26 @@ func (b *Bolt) GetTransport() mercure.Transport { //nolint:ireturn
 //
 //nolint:wrapcheck
 func (b *Bolt) Provision(ctx caddy.Context) error {
+	if b.Path == "" {
+		b.Path = filepath.Join(caddy.AppDataDir(), "mercure.db")
+	}
+
 	var key bytes.Buffer
 	if err := gob.NewEncoder(&key).Encode(b); err != nil {
 		return err
 	}
+
 	b.transportKey = key.String()
 
 	destructor, _, err := TransportUsagePool.LoadOrNew(b.transportKey, func() (caddy.Destructor, error) {
-		t, err := mercure.NewBoltTransport(ctx.Logger(), b.Path, b.BucketName, b.Size, b.CleanupFrequency)
+		t, err := mercure.NewBoltTransport(
+			mercure.NewSubscriberList(ctx.Value(SubscriberListCacheSizeContextKey).(int)),
+			ctx.Slogger(),
+			b.Path,
+			b.BucketName,
+			b.Size,
+			b.CleanupFrequency,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -98,7 +111,7 @@ func (b *Bolt) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 				f, e := strconv.ParseFloat(d.Val(), 64)
 				if e != nil {
-					return e
+					return d.WrapErr(e)
 				}
 
 				b.CleanupFrequency = f
@@ -110,7 +123,7 @@ func (b *Bolt) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 				s, e := strconv.ParseUint(d.Val(), 10, 64)
 				if e != nil {
-					return e
+					return d.WrapErr(e)
 				}
 
 				b.Size = s
