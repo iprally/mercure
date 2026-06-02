@@ -41,15 +41,11 @@ func TestRedisWaitListen(t *testing.T) {
 	require.NoError(t, transport.AddSubscriber(context.Background(), s))
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go func() {
+	wg.Go(func() {
 		for range s.Receive() {
 			t.Fail()
 		}
-
-		wg.Done()
-	}()
+	})
 
 	s.Disconnect()
 	wg.Wait()
@@ -181,9 +177,9 @@ func TestRedisConcurrent(t *testing.T) {
 	counter2 := atomic.Int64{}
 	counter3 := atomic.Int64{}
 
-	transport1Subscribers := []*LocalSubscriber{}
-	transport2Subscribers := []*LocalSubscriber{}
-	transport3Subscribers := []*LocalSubscriber{}
+	transport1Subscribers := make([]*LocalSubscriber, 0, transport1SubscribersCount)
+	transport2Subscribers := make([]*LocalSubscriber, 0, transport2SubscribersCount)
+	transport3Subscribers := make([]*LocalSubscriber, 0, transport3SubscribersCount)
 
 	defer func() {
 		if recover() != nil {

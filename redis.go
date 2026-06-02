@@ -133,9 +133,11 @@ func NewRedisTransportWithConfig(logger *slog.Logger, config *RedisConfig) (*Red
 	}
 
 	ctx := context.Background()
-	var client *redis.Client
 
-	var err error
+	var (
+		client *redis.Client
+		err    error
+	)
 
 	if config.UseIAMAuth {
 		// Use IAM authentication for Google Cloud Memorystore
@@ -190,6 +192,7 @@ func createRedisClientWithIAM(config *RedisConfig) (*redis.Client, error) {
 
 			// Create connection
 			dialer := &net.Dialer{}
+
 			conn, err := dialer.DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, fmt.Errorf("failed to dial connection: %w", err)
@@ -198,6 +201,7 @@ func createRedisClientWithIAM(config *RedisConfig) (*redis.Client, error) {
 			// For Google Cloud Memorystore, we need to send the token in the AUTH command
 			// The format is: AUTH <token>
 			authCommand := fmt.Sprintf("AUTH %s\r\n", token.AccessToken)
+
 			_, err = conn.Write([]byte(authCommand))
 			if err != nil {
 				conn.Close()
@@ -207,6 +211,7 @@ func createRedisClientWithIAM(config *RedisConfig) (*redis.Client, error) {
 
 			// Read response
 			buf := make([]byte, 1024)
+
 			n, err := conn.Read(buf)
 			if err != nil {
 				conn.Close()
@@ -228,7 +233,7 @@ func createRedisClientWithIAM(config *RedisConfig) (*redis.Client, error) {
 	return client, nil
 }
 
-func NewRedisTransportInstance(
+func NewRedisTransportInstance( //nolint:funlen
 	logger *slog.Logger,
 	client *redis.Client,
 	subscribersSize int,
@@ -267,12 +272,12 @@ func NewRedisTransportInstance(
 
 			<-subscribeCtx.Done()
 
-			if err := client.Close(); err != nil && !errors.Is(err, redis.ErrClosed) && logger.Enabled(context.Background(), slog.LevelError) {
-				logger.LogAttrs(context.Background(), slog.LevelError, err.Error())
+			if err := client.Close(); err != nil && !errors.Is(err, redis.ErrClosed) && logger.Enabled(subscribeCtx, slog.LevelError) {
+				logger.LogAttrs(subscribeCtx, slog.LevelError, err.Error())
 			}
 
-			if logger.Enabled(context.Background(), slog.LevelInfo) {
-				logger.LogAttrs(context.Background(), slog.LevelInfo, "Redis connection closed",
+			if logger.Enabled(subscribeCtx, slog.LevelInfo) {
+				logger.LogAttrs(subscribeCtx, slog.LevelInfo, "Redis connection closed",
 					slog.String("address", transport.client.Options().Addr),
 				)
 			}
@@ -280,15 +285,7 @@ func NewRedisTransportInstance(
 		}
 	}()
 
-	wg := sync.WaitGroup{}
-
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		transport.subscribe(subscribeCtx, subscribeCancel, subscriber)
-	}()
+	go transport.subscribe(subscribeCtx, subscribeCancel, subscriber)
 
 	return transport, nil
 }
@@ -312,7 +309,7 @@ func (t *RedisTransport) Dispatch(ctx context.Context, update *Update) error {
 	update.AssignUUID()
 
 	keys := []string{lastEventIDKey, t.historyStreamKey}
-	arguments := []interface{}{update.ID, t.redisChannel, update, t.historySize}
+	arguments := []any{update.ID, t.redisChannel, update, t.historySize}
 
 	_, err := t.publishScript.Run(ctx, t.client, keys, arguments...).Result()
 	if err != nil {
