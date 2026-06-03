@@ -34,3 +34,7 @@
 - [Using Mercure and Hotwire to Stream Page Changes](ecosystem/hotwire.md)
 - [Getting Help](ecosystem/help.md)
 - [Conformance Tests](ecosystem/conformance-tests.md)
+
+## Fork Maintenance
+
+- [Updating This Fork from Upstream](fork/upstream-sync.md)
