@@ -3,15 +3,16 @@
 package mercure
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/spf13/viper"
-	"go.uber.org/zap"
 )
 
 const (
@@ -24,7 +25,7 @@ const (
 var ErrUnsupportedProtocolVersion = errors.New("compatibility mode only supports protocol version 7")
 
 // Option instances allow to configure the library.
-type Option func(h *opt) error
+type Option func(o *opt) error
 
 // WithAnonymous allows subscribers with no valid JWT.
 func WithAnonymous() Option {
@@ -81,7 +82,7 @@ func WithSubscriptions() Option {
 }
 
 // WithLogger sets the logger to use.
-func WithLogger(logger Logger) Option {
+func WithLogger(logger *slog.Logger) Option {
 	return func(o *opt) error {
 		o.logger = logger
 
@@ -166,7 +167,7 @@ func WithAllowedHosts(hosts []string) Option {
 func validateOrigins(origins []string) error {
 	for _, origin := range origins {
 		switch origin {
-		case "*", "null":
+		case "*", "null": //nolint:goconst
 			continue
 		}
 
@@ -192,7 +193,28 @@ func WithPublishOrigins(origins []string) Option {
 			return err
 		}
 
-		o.publishOrigins = origins
+		// wildcard support has been adapted from https://github.com/rs/cors/blob/1084d89a16921942356d1c831fbe523426cf836e/cors.go#L171
+		// Copyright (c) 2014 Olivier Poitrey <rs@dailymotion.com>
+		// MIT licensed.
+		for _, origin := range origins {
+			// Note: for origins matching, the spec requires a case-sensitive matching.
+			// As it may error-prone, we chose to ignore the spec here.
+			origin = strings.ToLower(origin)
+			if origin == "*" {
+				// If "*" is present in the list, turn the whole list into a match all
+				o.publishOriginsAll = true
+				o.publishOrigins = nil
+				o.publishWOrigins = nil
+
+				break
+			} else if prefix, suffix, found := strings.Cut(origin, "*"); found {
+				// Split the origin in two: start and end string without the *
+				w := wildcard{prefix, suffix}
+				o.publishWOrigins = append(o.publishWOrigins, w)
+			} else {
+				o.publishOrigins = append(o.publishOrigins, origin)
+			}
+		}
 
 		return nil
 	}
@@ -263,7 +285,7 @@ type opt struct {
 	subscriptions                bool
 	ui                           bool
 	demo                         bool
-	logger                       Logger
+	logger                       *slog.Logger
 	writeTimeout                 time.Duration
 	dispatchTimeout              time.Duration
 	heartbeat                    time.Duration
@@ -271,7 +293,9 @@ type opt struct {
 	subscriberJWTKeyFunc         jwt.Keyfunc
 	metrics                      Metrics
 	allowedHosts                 []string
+	publishOriginsAll            bool
 	publishOrigins               []string
+	publishWOrigins              []wildcard
 	corsOrigins                  []string
 	cookieName                   string
 	protocolVersionCompatibility int
@@ -283,18 +307,15 @@ func (o *opt) isBackwardCompatiblyEnabledWith(version int) bool {
 
 // Hub stores channels with clients currently subscribed and allows to dispatch updates.
 type Hub struct {
+	deprecatedHub
 	*opt
 
 	handler http.Handler
-
-	// Deprecated: use the Caddy server module or the standalone library instead.
-	config        *viper.Viper
-	server        *http.Server
-	metricsServer *http.Server
+	ctx     context.Context //nolint:containedctx
 }
 
 // NewHub creates a new Hub instance.
-func NewHub(options ...Option) (*Hub, error) {
+func NewHub(ctx context.Context, options ...Option) (*Hub, error) {
 	opt := &opt{
 		writeTimeout:    DefaultWriteTimeout,
 		dispatchTimeout: DefaultDispatchTimeout,
@@ -308,25 +329,11 @@ func NewHub(options ...Option) (*Hub, error) {
 	}
 
 	if opt.logger == nil {
-		var (
-			l   Logger
-			err error
-		)
-		if opt.debug {
-			l, err = zap.NewDevelopment()
-		} else {
-			l, err = zap.NewProduction()
-		}
-
-		if err != nil {
-			return nil, fmt.Errorf("error when creating logger: %w", err)
-		}
-
-		opt.logger = l
+		opt.logger = slog.New(mercureHandler{slog.Default().Handler()})
 	}
 
 	if opt.topicSelectorStore == nil {
-		tss, err := NewTopicSelectorStoreLRU(DefaultTopicSelectorStoreLRUMaxEntriesPerShard, DefaultTopicSelectorStoreLRUShardCount)
+		tss, err := NewTopicSelectorStore(DefaultTopicSelectorStoreCacheSize)
 		if err != nil {
 			return nil, err
 		}
@@ -335,7 +342,7 @@ func NewHub(options ...Option) (*Hub, error) {
 	}
 
 	if opt.transport == nil {
-		opt.transport = NewLocalTransport()
+		opt.transport = NewLocalTransport(NewSubscriberList(DefaultSubscriberListCacheSize))
 	}
 
 	if ttss, ok := opt.transport.(TransportTopicSelectorStore); ok {
@@ -350,15 +357,15 @@ func NewHub(options ...Option) (*Hub, error) {
 		opt.cookieName = defaultCookieName
 	}
 
-	h := &Hub{opt: opt}
+	h := &Hub{opt: opt, ctx: ctx}
 	h.initHandler()
 
 	return h, nil
 }
 
 // Stop stops the hub.
-func (h *Hub) Stop() error {
-	if err := h.transport.Close(); err != nil {
+func (h *Hub) Stop(ctx context.Context) error {
+	if err := h.transport.Close(ctx); err != nil {
 		return fmt.Errorf("transport error: %w", err)
 	}
 

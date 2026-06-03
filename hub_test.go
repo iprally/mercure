@@ -1,20 +1,22 @@
 package mercure
 
 import (
+	"context"
+	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
-	"os/exec"
-	"sync"
+	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 )
 
 const (
@@ -22,12 +24,20 @@ const (
 	testMetricsAddr = "127.0.0.1:4243"
 )
 
+func TestMain(m *testing.M) {
+	flag.Parse()
+
+	if !testing.Verbose() {
+		slog.SetDefault(slog.New(slog.DiscardHandler))
+	}
+
+	os.Exit(m.Run())
+}
+
 func TestNewHub(t *testing.T) {
 	t.Parallel()
 
-	h := createDummy()
-
-	assert.IsType(t, &viper.Viper{}, h.config)
+	h := createDummy(t)
 
 	assert.False(t, h.anonymous)
 	assert.Equal(t, defaultCookieName, h.cookieName)
@@ -40,6 +50,7 @@ func TestNewHubWithConfig(t *testing.T) {
 	t.Parallel()
 
 	h, err := NewHub(
+		t.Context(),
 		WithPublisherJWT([]byte("foo"), jwt.SigningMethodHS256.Name),
 		WithSubscriberJWT([]byte("bar"), jwt.SigningMethodHS256.Name),
 	)
@@ -47,88 +58,92 @@ func TestNewHubWithConfig(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestNewHubValidationError(t *testing.T) {
-	assert.Panics(t, func() {
-		NewHubFromViper(viper.New())
-	})
-}
-
-func TestNewHubTransportValidationError(t *testing.T) {
-	t.Parallel()
-
-	v := viper.New()
-	v.Set("publisher_jwt_key", "foo")
-	v.Set("jwt_key", "bar")
-	v.Set("transport_url", "foo://")
-
-	assert.Panics(t, func() {
-		NewHubFromViper(viper.New())
-	})
-}
-
-func TestStartCrash(t *testing.T) {
-	t.Parallel()
-
-	if os.Getenv("BE_START_CRASH") == "1" {
-		Start()
-
-		return
-	}
-
-	cmd := exec.Command(os.Args[0], "-test.run=TestStartCrash") //nolint:gosec
-	cmd.Env = append(os.Environ(), "BE_START_CRASH=1")
-	err := cmd.Run()
-
-	var e *exec.ExitError
-	require.ErrorAs(t, err, &e)
-	assert.False(t, e.Success())
-}
-
 func TestStop(t *testing.T) {
 	t.Parallel()
 
-	const numberOfSubscribers = 2
+	synctest.Test(t, func(t *testing.T) {
+		hub := createAnonymousDummy(t)
+		ctx := t.Context()
 
-	hub := createAnonymousDummy()
+		go func() {
+			s := hub.transport.(*LocalTransport)
 
-	go func() {
-		s := hub.transport.(*LocalTransport)
+			var ready bool
 
-		var ready bool
+			for !ready {
+				s.RLock()
+				ready = s.subscribers.Len() == 2
+				s.RUnlock()
+			}
 
-		for !ready {
-			s.RLock()
-			ready = s.subscribers.Len() == numberOfSubscribers
-			s.RUnlock()
+			assert.NoError(t, hub.transport.Dispatch(ctx, &Update{
+				Topics: []string{"https://example.com/foo"},
+				Event:  Event{Data: "Hello World"},
+			}))
+
+			assert.NoError(t, hub.Stop(ctx))
+		}()
+
+		for range 2 {
+			go func() {
+				req := httptest.NewRequest(http.MethodGet, defaultHubURL+"?topic=https://example.com/foo", nil)
+
+				w := newSubscribeRecorder()
+				hub.SubscribeHandler(w, req)
+
+				r := w.Result()
+				assert.NoError(t, r.Body.Close())
+				assert.Equal(t, 200, r.StatusCode)
+			}()
 		}
 
-		hub.transport.Dispatch(&Update{
-			Topics: []string{"http://example.com/foo"},
-			Event:  Event{Data: "Hello World"},
+		synctest.Wait()
+	})
+}
+
+func TestContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+
+		hub, err := NewHub(ctx, WithAnonymous())
+		require.NoError(t, err)
+
+		t.Cleanup(func() {
+			require.NoError(t, hub.Stop(ctx))
 		})
 
-		hub.Stop()
-	}()
-
-	var wg sync.WaitGroup
-	wg.Add(numberOfSubscribers)
-
-	for i := 0; i < numberOfSubscribers; i++ {
 		go func() {
-			defer wg.Done()
+			s := hub.transport.(*LocalTransport)
 
-			req := httptest.NewRequest(http.MethodGet, defaultHubURL+"?topic=http://example.com/foo", nil)
+			var ready bool
 
-			w := newSubscribeRecorder()
-			hub.SubscribeHandler(w, req)
+			for !ready {
+				s.RLock()
+				ready = s.subscribers.Len() == 2
+				s.RUnlock()
+			}
 
-			r := w.Result()
-			r.Body.Close()
-			assert.Equal(t, 200, r.StatusCode)
+			cancel()
 		}()
-	}
 
-	wg.Wait()
+		for range 2 {
+			go func() {
+				req := httptest.NewRequest(http.MethodGet, defaultHubURL+"?topic=https://example.com/foo", nil)
+
+				w := newSubscribeRecorder()
+				hub.SubscribeHandler(w, req)
+
+				r := w.Result()
+				_ = r.Body.Close()
+				assert.Equal(t, 200, r.StatusCode)
+			}()
+		}
+
+		synctest.Wait()
+	})
 }
 
 func TestWithProtocolVersionCompatibility(t *testing.T) {
@@ -181,7 +196,7 @@ func TestWithPublisherJWTKeyFunc(t *testing.T) {
 
 	op := &opt{}
 
-	o := WithPublisherJWTKeyFunc(func(_ *jwt.Token) (interface{}, error) { return []byte{}, nil })
+	o := WithPublisherJWTKeyFunc(func(_ *jwt.Token) (any, error) { return []byte{}, nil })
 	require.NoError(t, o(op))
 	require.NotNil(t, op.publisherJWTKeyFunc)
 }
@@ -191,7 +206,7 @@ func TestWithSubscriberJWTKeyFunc(t *testing.T) {
 
 	op := &opt{}
 
-	o := WithSubscriberJWTKeyFunc(func(_ *jwt.Token) (interface{}, error) { return []byte{}, nil })
+	o := WithSubscriberJWTKeyFunc(func(_ *jwt.Token) (any, error) { return []byte{}, nil })
 	require.NoError(t, o(op))
 	require.NotNil(t, op.subscriberJWTKeyFunc)
 }
@@ -223,14 +238,15 @@ func TestOriginsValidator(t *testing.T) {
 		{"*"},
 		{"null"},
 		{"https://example.com"},
-		{"http://example.com:8000"},
-		{"https://example.com", "http://example.org"},
+		{"https://example.com:8000"},
+		{"https://example.com", "https://example.org"},
 		{"https://example.com", "*"},
 		{"null", "https://example.com:3000"},
 		{"capacitor://"},
 		{"capacitor://www.example.com"},
 		{"ionic://"},
 		{"foobar://"},
+		{"https://*.example.com"},
 	}
 
 	invalidOrigins := [][]string{
@@ -240,7 +256,7 @@ func TestOriginsValidator(t *testing.T) {
 		{"https://example.com/"},
 		{"https://user@example.com"},
 		{"https://example.com:abc"},
-		{"https://example.com", "http://example.org/hello"},
+		{"https://example.com", "https://example.org/hello"},
 		{"https://example.com?query", "*"},
 		{"null", "https://example.com:3000#fragment"},
 	}
@@ -262,33 +278,150 @@ func TestOriginsValidator(t *testing.T) {
 	}
 }
 
-func createDummy(options ...Option) *Hub {
-	tss, _ := NewTopicSelectorStoreLRU(0, 0)
+func TestSecurityHeaders(t *testing.T) {
+	t.Parallel()
+
+	hub := createAnonymousDummy(t, WithSubscriptions(), WithCORSOrigins([]string{"https://example.com"}), WithDemo())
+
+	form := url.Values{}
+	form.Add("id", "id")
+	form.Add("topic", "https://example.com/books/1")
+	form.Add("data", "Hello!")
+	form.Add("private", "on")
+
+	req := httptest.NewRequest(http.MethodPost, defaultHubURL, strings.NewReader(form.Encode()))
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Authorization", bearerPrefix+createDummyAuthorizedJWT(rolePublisher, []string{"*"}))
+
+	w := httptest.NewRecorder()
+	hub.ServeHTTP(w, req)
+
+	resp := w.Result()
+
+	t.Cleanup(func() {
+		assert.NoError(t, resp.Body.Close())
+	})
+
+	assert.Equal(t, "default-src 'self' mercure.rocks cdn.jsdelivr.net", resp.Header.Get("Content-Security-Policy"))
+	assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+	assert.Equal(t, "DENY", resp.Header.Get("X-Frame-Options"))
+	assert.Equal(t, "1; mode=block", resp.Header.Get("X-Xss-Protection"))
+	require.NoError(t, resp.Body.Close())
+
+	// Preflight request
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodOptions, defaultHubURL, nil)
+	req.Header.Add("Origin", "https://example.com")
+	req.Header.Add("Access-Control-Request-Headers", "authorization,cache-control,last-event-id")
+	req.Header.Add("Access-Control-Request-Method", http.MethodGet)
+	hub.ServeHTTP(w, req)
+
+	resp2 := w.Result()
+	require.NotNil(t, resp2)
+
+	assert.Equal(t, "true", resp2.Header.Get("Access-Control-Allow-Credentials"))
+	assert.Equal(t, "authorization,cache-control,last-event-id", resp2.Header.Get("Access-Control-Allow-Headers"))
+	assert.Equal(t, "https://example.com", resp2.Header.Get("Access-Control-Allow-Origin"))
+	require.NoError(t, resp2.Body.Close())
+
+	// Subscriptions
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, defaultHubURL+subscriptionsPath, nil)
+	hub.ServeHTTP(w, req)
+	resp3 := w.Result()
+
+	require.NotNil(t, resp3)
+	assert.Equal(t, http.StatusUnauthorized, resp3.StatusCode)
+	require.NoError(t, resp3.Body.Close())
+}
+
+func TestWithPublishDisabled(t *testing.T) {
+	t.Parallel()
+
+	h, err := NewHub(t.Context(), WithAnonymous())
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, defaultHubURL, nil))
+
+	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+}
+
+func TestWithSubscribeDisabled(t *testing.T) {
+	t.Parallel()
+
+	h, err := NewHub(t.Context(), WithPublisherJWT([]byte(""), "HS256"))
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, defaultHubURL, nil))
+
+	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+}
+
+// waitSubscribers waits until the LocalTransport reports exactly n live
+// subscribers. Used to synchronize tests that need subscribers registered
+// before a Dispatch or context cancel runs. Sleeps between checks to avoid
+// busy-spinning, and fails the test via tb.Fatalf after 5s so a genuinely
+// stuck expectation surfaces as a clear error instead of a hung suite.
+func waitSubscribers(tb testing.TB, transport *LocalTransport, n int) {
+	tb.Helper()
+
+	const timeout = 5 * time.Second
+
+	deadline := time.Now().Add(timeout)
+
+	for {
+		transport.RLock()
+		got := transport.subscribers.Len()
+		transport.RUnlock()
+
+		if got == n {
+			return
+		}
+
+		if !time.Now().Before(deadline) {
+			tb.Fatalf("waited %s for %d subscribers, have %d", timeout, n, got)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func createDummy(tb testing.TB, options ...Option) *Hub {
+	tb.Helper()
+
+	tss, err := NewTopicSelectorStore(0)
+	require.NoError(tb, err)
+
 	options = append(
 		[]Option{
 			WithPublisherJWT([]byte("publisher"), jwt.SigningMethodHS256.Name),
 			WithSubscriberJWT([]byte("subscriber"), jwt.SigningMethodHS256.Name),
-			WithLogger(zap.NewNop()),
 			WithTopicSelectorStore(tss),
 		},
 		options...,
 	)
 
-	h, _ := NewHub(options...)
-	h.config = viper.New()
-	h.config.Set("addr", testAddr)
-	h.config.Set("metrics_addr", testMetricsAddr)
+	h, err := NewHub(tb.Context(), options...)
+	require.NoError(tb, err)
+
+	setDeprecatedOptions(tb, h)
 
 	return h
 }
 
-func createAnonymousDummy(options ...Option) *Hub {
+func createAnonymousDummy(tb testing.TB, options ...Option) *Hub {
+	tb.Helper()
+
 	options = append(
 		[]Option{WithAnonymous()},
 		options...,
 	)
 
-	return createDummy(options...)
+	return createDummy(tb, options...)
 }
 
 func createDummyAuthorizedJWT(r role, topics []string) string {
@@ -297,7 +430,7 @@ func createDummyAuthorizedJWT(r role, topics []string) string {
 	}{Foo: "bar"})
 }
 
-func createDummyAuthorizedJWTWithPayload(r role, topics []string, payload interface{}) string {
+func createDummyAuthorizedJWTWithPayload(r role, topics []string, payload any) string {
 	token := jwt.New(jwt.SigningMethodHS256)
 
 	var key []byte

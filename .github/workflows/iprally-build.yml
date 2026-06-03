@@ -9,6 +9,7 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    environment: build
 
     permissions:
       contents: read
@@ -17,6 +18,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Sync tags from upstream repository and get latest tag
         id: get-latest-tag
@@ -38,7 +41,7 @@ jobs:
           token_format: access_token
           access_token_lifetime: 3600s
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: '${{ secrets.GCP_SERVICE_ACCOUNT }}'
+          service_account: "${{ secrets.GCP_SERVICE_ACCOUNT }}"
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
       - name: Login to Google Artifact Registry

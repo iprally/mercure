@@ -3,11 +3,13 @@ package mercure
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
-	"go.uber.org/zap"
 )
 
 // claims contains Mercure's JWT claims.
@@ -20,9 +22,9 @@ type claims struct {
 }
 
 type mercureClaim struct {
-	Publish   []string    `json:"publish"`
-	Subscribe []string    `json:"subscribe"`
-	Payload   interface{} `json:"payload"`
+	Publish   []string `json:"publish"`
+	Subscribe []string `json:"subscribe"`
+	Payload   any      `json:"payload"`
 }
 
 type role int
@@ -30,7 +32,9 @@ type role int
 const (
 	defaultCookieName = "mercureAuthorization"
 	bearerPrefix      = "Bearer "
+)
 
+const (
 	roleSubscriber role = iota
 	rolePublisher
 )
@@ -48,11 +52,32 @@ var (
 	ErrInvalidJWT = errors.New("invalid JWT")
 )
 
-// Authorize validates the JWT that may be provided through an "Authorization" HTTP header or an authorization cookie.
+// wildcard has been copied from https://github.com/rs/cors/blob/1084d89a16921942356d1c831fbe523426cf836e/utils.go
+// Copyright (c) 2014 Olivier Poitrey <rs@dailymotion.com>
+// MIT licensed.
+type wildcard struct {
+	prefix string
+	suffix string
+}
+
+func (w wildcard) match(s string) bool {
+	return len(s) >= len(w.prefix)+len(w.suffix) &&
+		strings.HasPrefix(s, w.prefix) &&
+		strings.HasSuffix(s, w.suffix)
+}
+
+// authorize validates the JWT that may be provided through an "Authorization" HTTP header or an authorization cookie.
 // It returns the claims contained in the token if it exists and is valid, nil if no token is provided (anonymous mode), and an error if the token is not valid.
-func authorize(r *http.Request, jwtKeyfunc jwt.Keyfunc, publishOrigins []string, cookieName string) (*claims, error) {
-	authorizationHeaders, headerExists := r.Header["Authorization"]
-	if headerExists {
+func (h *Hub) authorize(r *http.Request, publish bool) (*claims, error) { //nolint:funlen
+	var jwtKeyfunc jwt.Keyfunc
+	if publish {
+		jwtKeyfunc = h.publisherJWTKeyFunc
+	} else {
+		jwtKeyfunc = h.subscriberJWTKeyFunc
+	}
+
+	authorizationHeaders, authorizationHeaderExists := r.Header["Authorization"]
+	if authorizationHeaderExists {
 		if len(authorizationHeaders) != 1 || len(authorizationHeaders[0]) < 48 || authorizationHeaders[0][:7] != bearerPrefix {
 			return nil, ErrInvalidAuthorizationHeader
 		}
@@ -68,7 +93,7 @@ func authorize(r *http.Request, jwtKeyfunc jwt.Keyfunc, publishOrigins []string,
 		return validateJWT(authorizationQuery[0], jwtKeyfunc)
 	}
 
-	cookie, err := r.Cookie(cookieName)
+	cookie, err := r.Cookie(h.cookieName)
 	if err != nil {
 		// Anonymous
 		return nil, nil //nolint:nilerr,nilnil
@@ -95,14 +120,26 @@ func authorize(r *http.Request, jwtKeyfunc jwt.Keyfunc, publishOrigins []string,
 		origin = fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 	}
 
-	for _, allowedOrigin := range publishOrigins {
-		if allowedOrigin == "*" || origin == allowedOrigin {
+	if h.publishOriginsAll {
+		return validateJWT(cookie.Value, jwtKeyfunc)
+	}
+
+	if slices.Contains(h.publishOrigins, origin) {
+		return validateJWT(cookie.Value, jwtKeyfunc)
+	}
+
+	for _, allowedOrigin := range h.publishWOrigins {
+		if allowedOrigin.match(origin) {
 			return validateJWT(cookie.Value, jwtKeyfunc)
 		}
 	}
 
 	return nil, fmt.Errorf("%q: %w", origin, ErrOriginNotAllowed)
 }
+
+// ErrTooManyClaimMatchers is returned when mercure.subscribe or
+// mercure.publish exceeds maxClaimMatchers.
+var ErrTooManyClaimMatchers = errors.New("too many matchers in mercure claim")
 
 // validateJWT validates that the provided JWT token is a valid Mercure token.
 func validateJWT(encodedToken string, jwtKeyfunc jwt.Keyfunc) (*claims, error) {
@@ -111,15 +148,20 @@ func validateJWT(encodedToken string, jwtKeyfunc jwt.Keyfunc) (*claims, error) {
 		return nil, fmt.Errorf("unable to parse JWT: %w", err)
 	}
 
-	if claims, ok := token.Claims.(*claims); ok && token.Valid {
-		if claims.MercureNamespaced != nil {
-			claims.Mercure = *claims.MercureNamespaced
-		}
-
-		return claims, nil
+	c, ok := token.Claims.(*claims)
+	if !ok || !token.Valid {
+		return nil, ErrInvalidJWT
 	}
 
-	return nil, ErrInvalidJWT
+	if c.MercureNamespaced != nil {
+		c.Mercure = *c.MercureNamespaced
+	}
+
+	if len(c.Mercure.Publish) > maxClaimMatchers || len(c.Mercure.Subscribe) > maxClaimMatchers {
+		return nil, ErrTooManyClaimMatchers
+	}
+
+	return c, nil
 }
 
 func canReceive(s *TopicSelectorStore, topics, topicSelectors []string) bool {
@@ -161,7 +203,8 @@ func canDispatch(s *TopicSelectorStore, topics, topicSelectors []string) bool {
 func (h *Hub) httpAuthorizationError(w http.ResponseWriter, r *http.Request, err error) {
 	http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 
-	if c := h.logger.Check(zap.DebugLevel, "Topic selectors not matched, not provided or authorization error"); c != nil {
-		c.Write(zap.String("remote_addr", r.RemoteAddr), zap.Error(err))
+	ctx := r.Context()
+	if h.logger.Enabled(ctx, slog.LevelDebug) {
+		h.logger.LogAttrs(ctx, slog.LevelDebug, "Topic selectors not matched, not provided or authorization error", slog.Any("error", err))
 	}
 }

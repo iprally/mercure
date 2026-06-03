@@ -1,72 +1,53 @@
 package mercure
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"net/url"
-	"sync"
 )
 
 // EarliestLastEventID is the reserved value representing the earliest available event id.
 const EarliestLastEventID = "earliest"
 
-// TransportFactory is the factory to initialize a new transport.
-type TransportFactory = func(u *url.URL, l Logger) (Transport, error)
-
-var (
-	// Deprecated: directly instantiate the transport or use transports Caddy modules.
-	transportFactories   = make(map[string]TransportFactory) //nolint:gochecknoglobals
-	transportFactoriesMu sync.RWMutex                        //nolint:gochecknoglobals
-)
-
-// Deprecated: directly instantiate the transport or use transports Caddy modules.
-func RegisterTransportFactory(scheme string, factory TransportFactory) {
-	transportFactoriesMu.Lock()
-
-	transportFactories[scheme] = factory
-
-	transportFactoriesMu.Unlock()
-}
-
 // Transport provides methods to dispatch and persist updates.
 type Transport interface {
 	// Dispatch dispatches an update to all subscribers.
-	Dispatch(update *Update) error
+	Dispatch(ctx context.Context, u *Update) error
 
 	// AddSubscriber adds a new subscriber to the transport.
-	AddSubscriber(s *LocalSubscriber) error
+	AddSubscriber(ctx context.Context, s *LocalSubscriber) error
 
 	// RemoveSubscriber removes a subscriber from the transport.
-	RemoveSubscriber(s *LocalSubscriber) error
+	RemoveSubscriber(ctx context.Context, s *LocalSubscriber) error
 
 	// Close closes the Transport.
-	Close() error
-}
-
-// Deprecated: directly instantiate the transport or use transports Caddy modules.
-func NewTransport(u *url.URL, l Logger) (Transport, error) { //nolint:ireturn
-	transportFactoriesMu.RLock()
-
-	f, ok := transportFactories[u.Scheme]
-
-	transportFactoriesMu.RUnlock()
-
-	if !ok {
-		return nil, &TransportError{dsn: u.Redacted(), msg: "no such transport available"}
-	}
-
-	return f(u, l)
+	Close(ctx context.Context) error
 }
 
 // TransportSubscribers provides a method to retrieve the list of active subscribers.
 type TransportSubscribers interface {
 	// GetSubscribers gets the last event ID and the list of active subscribers at this time.
-	GetSubscribers() (string, []*Subscriber, error)
+	GetSubscribers(ctx context.Context) (string, []*Subscriber, error)
 }
 
 // TransportTopicSelectorStore provides a method to pass the TopicSelectorStore to the transport.
 type TransportTopicSelectorStore interface {
 	SetTopicSelectorStore(store *TopicSelectorStore)
+}
+
+// TransportHealthChecker may be implemented by transports that support health checking.
+// Transports that do not implement this interface are assumed to always be healthy.
+type TransportHealthChecker interface {
+	// Ready reports whether the transport can currently serve traffic.
+	// Returns nil if healthy, or an error describing the problem.
+	// This is typically used for readiness probes (e.g. Kubernetes).
+	Ready(ctx context.Context) error
+
+	// Live reports whether the transport is fundamentally operational.
+	// Returns nil if alive, or an error if the transport has been unhealthy
+	// for an extended period and should be restarted.
+	// This is typically used for liveness probes (e.g. Kubernetes).
+	Live(ctx context.Context) error
 }
 
 // ErrClosedTransport is returned by the Transport's Dispatch and AddSubscriber methods after a call to Close.
@@ -106,5 +87,5 @@ func getSubscribers(sl *SubscriberList) (subscribers []*Subscriber) {
 		return true
 	})
 
-	return
+	return subscribers
 }

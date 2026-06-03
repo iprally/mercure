@@ -2,33 +2,39 @@ package mercure
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/rand"
-	"net/url"
-	"strconv"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const BoltDefaultCleanupFrequency = 0.3
 
-func init() { //nolint:gochecknoinits
-	RegisterTransportFactory("bolt", DeprecatedNewBoltTransport)
-}
-
 const defaultBoltBucketName = "updates"
+
+// maxHistoryScan caps how many history events a single subscriber
+// reconnection can force the transport to walk before giving up on
+// finding the requested Last-Event-ID. The cap is a denial-of-service
+// guard: without it, an attacker sending an ancient or non-existent
+// Last-Event-ID forces an O(history-size) scan on every request.
+const maxHistoryScan = 10000
 
 // BoltTransport implements the TransportInterface using the Bolt database.
 type BoltTransport struct {
 	sync.RWMutex
 
 	subscribers      *SubscriberList
-	logger           Logger
+	logger           *slog.Logger
 	db               *bolt.DB
 	bucketName       string
 	size             uint64
@@ -39,53 +45,10 @@ type BoltTransport struct {
 	lastEventID      string
 }
 
-// DeprecatedNewBoltTransport creates a new BoltTransport.
-//
-// Deprecated: use NewBoltTransport() instead.
-func DeprecatedNewBoltTransport(u *url.URL, l Logger) (Transport, error) { //nolint:ireturn
-	var err error
-
-	q := u.Query()
-	bucketName := defaultBoltBucketName
-
-	if q.Get("bucket_name") != "" {
-		bucketName = q.Get("bucket_name")
-	}
-
-	size := uint64(0)
-	if sizeParameter := q.Get("size"); sizeParameter != "" {
-		size, err = strconv.ParseUint(sizeParameter, 10, 64)
-		if err != nil {
-			return nil, &TransportError{u.Redacted(), fmt.Sprintf(`invalid "size" parameter %q`, sizeParameter), err}
-		}
-	}
-
-	cleanupFrequency := BoltDefaultCleanupFrequency
-	cleanupFrequencyParameter := q.Get("cleanup_frequency")
-
-	if cleanupFrequencyParameter != "" {
-		cleanupFrequency, err = strconv.ParseFloat(cleanupFrequencyParameter, 64)
-		if err != nil {
-			return nil, &TransportError{u.Redacted(), fmt.Sprintf(`invalid "cleanup_frequency" parameter %q`, cleanupFrequencyParameter), err}
-		}
-	}
-
-	path := u.Path // absolute path (bolt:///path.db)
-
-	if path == "" {
-		path = u.Host // relative path (bolt://path.db)
-	}
-
-	if path == "" {
-		return nil, &TransportError{u.Redacted(), "missing path", err}
-	}
-
-	return NewBoltTransport(l, path, bucketName, size, cleanupFrequency)
-}
-
 // NewBoltTransport creates a new BoltTransport.
 func NewBoltTransport(
-	logger Logger,
+	subscriberList *SubscriberList,
+	logger *slog.Logger,
 	path string,
 	bucketName string,
 	size uint64,
@@ -97,6 +60,13 @@ func NewBoltTransport(
 
 	if bucketName == "" {
 		bucketName = defaultBoltBucketName
+	}
+
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		// Path comes from operator config (Caddyfile or env), not HTTP input.
+		if err := os.MkdirAll(dir, 0o700); err != nil { //nolint:gosec
+			return nil, &TransportError{err: fmt.Errorf("creating bolt data directory %q: %w", dir, err)}
+		}
 	}
 
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 1 * time.Second})
@@ -115,10 +85,9 @@ func NewBoltTransport(
 		bucketName:       bucketName,
 		size:             size,
 		cleanupFrequency: cleanupFrequency,
-
-		subscribers: NewSubscriberList(1e5),
-		closed:      make(chan struct{}),
-		lastEventID: lastEventID,
+		subscribers:      subscriberList,
+		closed:           make(chan struct{}),
+		lastEventID:      lastEventID,
 	}, nil
 }
 
@@ -145,14 +114,14 @@ func getDBLastEventID(db *bolt.DB, bucketName string) (string, error) {
 }
 
 // Dispatch dispatches an update to all subscribers and persists it in Bolt DB.
-func (t *BoltTransport) Dispatch(update *Update) error {
+func (t *BoltTransport) Dispatch(ctx context.Context, update *Update) error {
 	select {
 	case <-t.closed:
 		return ErrClosedTransport
 	default:
 	}
 
-	AssignUUID(update)
+	update.AssignUUID()
 
 	updateJSON, err := json.Marshal(*update)
 	if err != nil {
@@ -168,14 +137,14 @@ func (t *BoltTransport) Dispatch(update *Update) error {
 	}
 
 	for _, s := range t.subscribers.MatchAny(update) {
-		s.Dispatch(update, false)
+		s.Dispatch(ctx, update, false)
 	}
 
 	return nil
 }
 
 // AddSubscriber adds a new subscriber to the transport.
-func (t *BoltTransport) AddSubscriber(s *LocalSubscriber) error {
+func (t *BoltTransport) AddSubscriber(ctx context.Context, s *LocalSubscriber) error {
 	select {
 	case <-t.closed:
 		return ErrClosedTransport
@@ -188,18 +157,18 @@ func (t *BoltTransport) AddSubscriber(s *LocalSubscriber) error {
 	t.Unlock()
 
 	if s.RequestLastEventID != "" {
-		if err := t.dispatchHistory(s, toSeq); err != nil {
+		if err := t.dispatchHistory(ctx, s, toSeq); err != nil {
 			return err
 		}
 	}
 
-	s.Ready()
+	s.Ready(ctx)
 
 	return nil
 }
 
 // RemoveSubscriber removes a new subscriber from the transport.
-func (t *BoltTransport) RemoveSubscriber(s *LocalSubscriber) error {
+func (t *BoltTransport) RemoveSubscriber(_ context.Context, s *LocalSubscriber) error {
 	select {
 	case <-t.closed:
 		return ErrClosedTransport
@@ -215,7 +184,7 @@ func (t *BoltTransport) RemoveSubscriber(s *LocalSubscriber) error {
 }
 
 // GetSubscribers get the list of active subscribers.
-func (t *BoltTransport) GetSubscribers() (string, []*Subscriber, error) {
+func (t *BoltTransport) GetSubscribers(_ context.Context) (string, []*Subscriber, error) {
 	t.RLock()
 	defer t.RUnlock()
 
@@ -223,7 +192,7 @@ func (t *BoltTransport) GetSubscribers() (string, []*Subscriber, error) {
 }
 
 // Close closes the Transport.
-func (t *BoltTransport) Close() (err error) {
+func (t *BoltTransport) Close(_ context.Context) (err error) {
 	t.closedOnce.Do(func() {
 		close(t.closed)
 
@@ -245,8 +214,26 @@ func (t *BoltTransport) Close() (err error) {
 	return fmt.Errorf("unable to close Bolt DB: %w", err)
 }
 
-//nolint:gocognit
-func (t *BoltTransport) dispatchHistory(s *LocalSubscriber, toSeq uint64) error {
+// pastSeqBound reports whether the BoltDB key k was written strictly after
+// the sequence snapshot toSeq, and therefore falls outside the subscriber's
+// history window. Events whose seq equals toSeq are the most recent ones
+// observed at subscription time and are still considered part of history.
+// toSeq == 0 means the bucket was empty at subscription time, so any key
+// (all with seq >= 1) is "past the bound".
+func pastSeqBound(k []byte, toSeq uint64) bool {
+	return binary.BigEndian.Uint64(k[:8]) > toSeq
+}
+
+//nolint:gocognit,funlen
+func (t *BoltTransport) dispatchHistory(ctx context.Context, s *LocalSubscriber, toSeq uint64) error {
+	ctx, span := startSpan(ctx, "mercure.transport.history",
+		trace.WithAttributes(
+			attribute.String("mercure.transport", "bolt"),
+			attribute.String("mercure.subscriber.id", s.ID),
+			attribute.String("mercure.last_event_id.requested", s.RequestLastEventID),
+		))
+	defer span.End()
+
 	err := t.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(t.bucketName))
 		if b == nil {
@@ -257,13 +244,49 @@ func (t *BoltTransport) dispatchHistory(s *LocalSubscriber, toSeq uint64) error 
 
 		c := b.Cursor()
 		responseLastEventID := EarliestLastEventID
-
 		afterFromID := s.RequestLastEventID == EarliestLastEventID
+		scanned := 0
+
 		for k, v := c.First(); k != nil; k, v = c.Next() {
+			// Keys written after the subscribe snapshot (concurrent Dispatch
+			// between subscriber registration and this read transaction)
+			// must not leak into the response header or be re-delivered
+			// alongside the live dispatch queue — check the bound first.
+			if pastSeqBound(k, toSeq) {
+				break
+			}
+
 			if !afterFromID {
-				responseLastEventID = string(k[8:])
-				if responseLastEventID == s.RequestLastEventID {
+				// DoS guard: cap the search-for-requested-ID phase only.
+				// Once afterFromID is true the loop is dispatching legitimate
+				// authorized history and must not be truncated.
+				if scanned >= maxHistoryScan {
+					break
+				}
+
+				scanned++
+
+				id := string(k[8:])
+				if id == s.RequestLastEventID {
 					afterFromID = true
+					// The subscriber already knows this id; echoing it
+					// is not a disclosure.
+					responseLastEventID = s.RequestLastEventID
+
+					continue
+				}
+
+				// Only disclose the id of an event the subscriber is
+				// authorized to read. We must deserialize to evaluate
+				// Match against the update's topics and Private flag.
+				var update *Update
+				if err := json.Unmarshal(v, &update); err != nil {
+					// Skip silently — do not disclose this id.
+					continue
+				}
+
+				if s.Match(update) {
+					responseLastEventID = id
 				}
 
 				continue
@@ -273,14 +296,16 @@ func (t *BoltTransport) dispatchHistory(s *LocalSubscriber, toSeq uint64) error 
 			if err := json.Unmarshal(v, &update); err != nil {
 				s.HistoryDispatched(responseLastEventID)
 
-				if c := t.logger.Check(zap.ErrorLevel, "Unable to unmarshal update coming from the Bolt DB"); c != nil {
-					c.Write(zap.Error(err))
+				err := fmt.Errorf("unable to unmarshal update: %w", err)
+
+				if t.logger.Enabled(ctx, slog.LevelError) {
+					t.logger.LogAttrs(ctx, slog.LevelError, "Unable to unmarshal update coming from the Bolt DB", slog.Any("update", update), slog.Any("error", err))
 				}
 
-				return fmt.Errorf("unable to unmarshal update: %w", err)
+				return err
 			}
 
-			if (s.Match(update) && !s.Dispatch(update, true)) || (toSeq > 0 && binary.BigEndian.Uint64(k[:8]) >= toSeq) {
+			if s.Match(update) && !s.Dispatch(ctx, update, true) {
 				s.HistoryDispatched(responseLastEventID)
 
 				return nil
@@ -290,15 +315,18 @@ func (t *BoltTransport) dispatchHistory(s *LocalSubscriber, toSeq uint64) error 
 		s.HistoryDispatched(responseLastEventID)
 
 		if !afterFromID {
-			if c := t.logger.Check(zap.InfoLevel, "Can't find requested LastEventID"); c != nil {
-				c.Write(zap.String("LastEventID", s.RequestLastEventID))
+			if t.logger.Enabled(ctx, slog.LevelInfo) {
+				t.logger.LogAttrs(ctx, slog.LevelInfo, "Can't find requested LastEventID")
 			}
 		}
 
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("unable to retrieve history from BoltDB: %w", err)
+		err = fmt.Errorf("unable to retrieve history from BoltDB: %w", err)
+		recordSpanError(span, err)
+
+		return err
 	}
 
 	return nil
@@ -316,6 +344,7 @@ func (t *BoltTransport) persist(updateID string, updateJSON []byte) error {
 		if err != nil {
 			return fmt.Errorf("error when generating Bolt DB sequence: %w", err)
 		}
+
 		prefix := make([]byte, 8)
 		binary.BigEndian.PutUint64(prefix, seq)
 
@@ -327,6 +356,7 @@ func (t *BoltTransport) persist(updateID string, updateJSON []byte) error {
 
 		t.lastSeq = seq
 		t.lastEventID = updateID
+
 		if err := bucket.Put(key, updateJSON); err != nil {
 			return fmt.Errorf("unable to put value in Bolt DB: %w", err)
 		}

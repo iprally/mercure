@@ -3,68 +3,49 @@ package mercure
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
-
-	"go.uber.org/zap"
 )
 
 func subscribeBenchmarkHelper(b *testing.B, subBench func(b *testing.B, topics, concurrency, matchPct int, testName string)) {
 	b.Helper()
 
-	var str []string
-
-	// How many topics and topicselectors do each subscriber and update contain (same value for both)
-	topicOpts := []int{1, 5, 10}
-	if opt := os.Getenv("SUB_TEST_TOPICS"); len(opt) > 0 {
-		topicOpts = []int{strInt(opt)}
+	// How many topics and topics electors do each subscriber and update contain (same value for both)
+	var topicOpts []int
+	if opt := os.Getenv("SUB_TEST_TOPICS"); opt != "" {
+		topicOpts = parseIntsEnvVar(opt)
 	} else {
-		str = append(str, "topics %d")
+		topicOpts = []int{1, 5, 10}
 	}
 
 	// How many concurrent subscribers
-	concurrencyOpts := []int{100, 1000, 5000, 20000}
-	if opt := os.Getenv("SUB_TEST_CONCURRENCY"); len(opt) > 0 {
-		concurrencyOpts = []int{strInt(opt)}
+	var concurrencyOpts []int
+	if opt := os.Getenv("SUB_TEST_CONCURRENCY"); opt != "" {
+		concurrencyOpts = parseIntsEnvVar(opt)
 	} else {
-		str = append(str, "concurrency %d")
+		concurrencyOpts = []int{100, 1000, 5000, 20000}
 	}
 
 	// What percentage of messages are delivered to a subscriber (ie 10 = 10% CanDispatch true)
-	matchPctOpts := []int{1, 10, 100}
-	if opt := os.Getenv("SUB_TEST_MATCHPCT"); len(opt) > 0 {
-		matchPctOpts = []int{strInt(opt)}
+	var matchPctOpts []int
+	if opt := os.Getenv("SUB_TEST_MATCHPCT"); opt != "" {
+		matchPctOpts = parseIntsEnvVar(opt)
 	} else {
-		str = append(str, "matchpct %d")
+		matchPctOpts = []int{1, 10, 100}
 	}
 
-	var arg []interface{}
 	for _, topics := range topicOpts {
-		arg := arg
-		if len(topicOpts) > 1 {
-			arg = append(arg, topics)
-		}
-
 		for _, concurrency := range concurrencyOpts {
-			arg := arg
-			if len(concurrencyOpts) > 1 {
-				arg = append(arg, concurrency)
-			}
-
 			for _, matchPct := range matchPctOpts {
-				arg := arg
-				if len(matchPctOpts) > 1 {
-					arg = append(arg, matchPct)
-				}
-
 				subBench(b,
 					topics,
 					concurrency,
 					matchPct,
-					fmt.Sprintf(strings.Join(str, " "), arg...),
+					fmt.Sprintf("%d-topics:%d-concurrency:%d-matchpct", topics, concurrency, matchPct),
 				)
 			}
 		}
@@ -75,27 +56,35 @@ func BenchmarkSubscriber(b *testing.B) {
 	subscribeBenchmarkHelper(b, subBenchSubscriber)
 }
 
-func strInt(s string) int {
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		panic(err)
+func parseIntsEnvVar(s string) (res []int) {
+	parts := strings.Split(s, ",")
+	res = make([]int, len(parts))
+
+	for i, part := range parts {
+		v, err := strconv.Atoi(part)
+		if err != nil {
+			panic(err)
+		}
+
+		res[i] = v
 	}
 
-	return n
+	return res
 }
 
 func subBenchSubscriber(b *testing.B, topics, concurrency, matchPct int, testName string) {
 	b.Helper()
 
-	s := NewLocalSubscriber("0e249241-6432-4ce1-b9b9-5d170163c253", zap.NewNop(), &TopicSelectorStore{})
+	s := NewLocalSubscriber("0e249241-6432-4ce1-b9b9-5d170163c253", slog.Default(), &TopicSelectorStore{})
 	ts := make([]string, topics)
 	tsMatch := make([]string, topics)
+	ctx := b.Context()
 
 	tsNoMatch := make([]string, topics)
-	for i := 0; i < topics; i++ {
-		ts[i] = fmt.Sprintf("/%d/{%d}", rand.Int(), rand.Int()) //nolint:gosec
+	for i := range topics {
+		ts[i] = fmt.Sprintf("/%d/{%d}", rand.Int(), rand.Int())
 
-		tsNoMatch[i] = fmt.Sprintf("/%d/%d", rand.Int(), rand.Int()) //nolint:gosec
+		tsNoMatch[i] = fmt.Sprintf("/%d/%d", rand.Int(), rand.Int())
 		if topics/2 == i {
 			// Insert matching topic half-way through matching topic list to simulate match
 			tsMatch[i] = strings.ReplaceAll(strings.ReplaceAll(ts[i], "{", ""), "}", "")
@@ -105,12 +94,12 @@ func subBenchSubscriber(b *testing.B, topics, concurrency, matchPct int, testNam
 	}
 
 	s.SetTopics(ts, nil)
-	defer s.Disconnect()
+	b.Cleanup(s.Disconnect)
 
-	ctx, done := context.WithCancel(b.Context())
+	ctx, done := context.WithCancel(ctx)
 	defer done()
 
-	for i := 0; i < 1; i++ {
+	for range 1 {
 		go func() {
 			for {
 				select {
@@ -127,38 +116,22 @@ func subBenchSubscriber(b *testing.B, topics, concurrency, matchPct int, testNam
 		b.RunParallel(func(pb *testing.PB) {
 			for i := 0; pb.Next(); i++ {
 				if i%100 < matchPct {
-					s.Dispatch(&Update{Topics: tsMatch}, i%2 == 0 /* half history, half live */)
+					s.Dispatch(ctx, &Update{Topics: tsMatch}, i%2 == 0 /* half history, half live */)
 				} else {
-					s.Dispatch(&Update{Topics: tsNoMatch}, i%2 == 0 /* half history, half live */)
+					s.Dispatch(ctx, &Update{Topics: tsNoMatch}, i%2 == 0 /* half history, half live */)
 				}
 			}
 		})
 	})
 }
 
-/* --- test.sh ---
+/*
 These are example commands that can be used to run subsets of this test for analysis.
 Omission of any environment variable causes the test to enumerate a few meaningful options.
 
-#!/usr/bin/sh
-
-set -e
-
-mkdir -p _dist
-
-# --- Generating a cpu call graph ---
-
 SUB_TEST_CONCURRENCY=20000 \
-SUB_TEST_TOPICS=20 \
-SUB_TEST_MATCHPCT=50 \
-SUB_TEST_SKIPSELECT=false \
-SUB_TEST_CACHE=lru \
-SUB_TEST_SHARDS=256 \
-go test -bench=. -run=BenchmarkSubscriber -cpuprofile _dist/profile.20kc.20top.50pct.noskip.lru.256sh.out -benchmem
-
-go build -o _dist/bin
-
-go tool pprof --pdf _dist/bin _dist/profile.20kc.20top.50pct.noskip.lru.256sh.out \
-                            > _dist/profile.20kc.20top.50pct.noskip.lru.256sh.pdf
-
+	SUB_TEST_TOPICS=20 \
+	SUB_TEST_MATCHPCT=50 \
+	go test -bench=. -run=BenchmarkSubscriber -cpuprofile profile.out -benchmem
+go tool pprof --pdf _dist/bin profile.out > profile.pdf
 */

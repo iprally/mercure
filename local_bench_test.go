@@ -3,10 +3,12 @@ package mercure
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"testing"
 
-	"go.uber.org/zap"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func BenchmarkLocalTransport(b *testing.B) {
@@ -16,32 +18,35 @@ func BenchmarkLocalTransport(b *testing.B) {
 func subBenchLocalTransport(b *testing.B, topics, concurrency, matchPct int, testName string) {
 	b.Helper()
 
-	tr := NewLocalTransport()
-	defer tr.Close()
+	tr := NewLocalTransport(NewSubscriberList(1_000))
+	ctx := b.Context()
+
+	b.Cleanup(func() {
+		assert.NoError(b, tr.Close(ctx))
+	})
 
 	top := make([]string, topics)
 	tsMatch := make([]string, topics)
 
 	tsNoMatch := make([]string, topics)
-	for i := 0; i < topics; i++ {
-		tsNoMatch[i] = fmt.Sprintf("/%d/{%d}", rand.Int(), rand.Int()) //nolint:gosec
+	for i := range topics {
+		tsNoMatch[i] = fmt.Sprintf("/%d/{%d}", rand.Int(), rand.Int())
 		if topics/2 == i {
-			n1 := rand.Int() //nolint:gosec
-			n2 := rand.Int() //nolint:gosec
+			n1 := rand.Int()
+			n2 := rand.Int()
 			top[i] = fmt.Sprintf("/%d/%d", n1, n2)
 			tsMatch[i] = fmt.Sprintf("/%d/{%d}", n1, n2)
 		} else {
-			top[i] = fmt.Sprintf("/%d/%d", rand.Int(), rand.Int()) //nolint:gosec
+			top[i] = fmt.Sprintf("/%d/%d", rand.Int(), rand.Int())
 			tsMatch[i] = tsNoMatch[i]
 		}
 	}
 
 	tss := &TopicSelectorStore{}
-	logger := zap.NewNop()
 
 	subscribers := make([]*LocalSubscriber, concurrency)
-	for i := 0; i < concurrency; i++ {
-		s := NewLocalSubscriber("", logger, tss)
+	for i := range concurrency {
+		s := NewLocalSubscriber("", slog.Default(), tss)
 		if i%100 < matchPct {
 			s.SetTopics(tsMatch, nil)
 		} else {
@@ -49,13 +54,13 @@ func subBenchLocalTransport(b *testing.B, topics, concurrency, matchPct int, tes
 		}
 
 		subscribers[i] = s
-		tr.AddSubscriber(s)
+		require.NoError(b, tr.AddSubscriber(ctx, s))
 	}
 
-	ctx, done := context.WithCancel(b.Context())
-	defer done()
+	ctx, done := context.WithCancel(ctx)
+	b.Cleanup(done)
 
-	for i := 0; i < concurrency; i++ {
+	for i := range concurrency {
 		go func() {
 			for {
 				select {
@@ -74,34 +79,19 @@ func subBenchLocalTransport(b *testing.B, topics, concurrency, matchPct int, tes
 	b.Run(testName, func(b *testing.B) {
 		b.RunParallel(func(pb *testing.PB) {
 			for i := 0; pb.Next(); i++ {
-				tr.Dispatch(&Update{Topics: top})
+				require.NoError(b, tr.Dispatch(ctx, &Update{Topics: top}))
 			}
 		})
 	})
 }
 
-/* --- test.sh ---
+/*
 These are example commands that can be used to run subsets of this test for analysis.
-Omission of any environment variable causes the test to enumate a few meaningful options.
-
-#!/usr/bin/sh
-
-set -e
-
-mkdir -p _dist
-
-# --- Generating a cpu call graph ---
+Omission of any environment variable causes the test to enumerate a few meaningful options.
 
 SUB_TEST_CONCURRENCY=20000 \
-SUB_TEST_TOPICS=20 \
-SUB_TEST_MATCHPCT=50 \
-SUB_TEST_CACHE=lru \
-SUB_TEST_SHARDS=256 \
-go test -bench=. -run=BenchmarkLocalTransport -cpuprofile _dist/profile.20kc.20top.50pct.noskip.lru.256sh.out -benchmem
-
-go build -o _dist/bin
-
-go tool pprof --pdf _dist/bin _dist/profile.20kc.20top.50pct.noskip.lru.256sh.out \
-                            > _dist/profile.20kc.20top.50pct.noskip.lru.256sh.pdf
-
+	SUB_TEST_TOPICS=20 \
+	SUB_TEST_MATCHPCT=50 \
+	go test -bench=. -run=BenchmarkLocalTransport -cpuprofile profile.out -benchmem
+go tool pprof --pdf _dist/bin profile.out > profile.pdf
 */

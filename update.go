@@ -1,10 +1,10 @@
 package mercure
 
 import (
-	"fmt"
+	"log/slog"
 
 	"github.com/gofrs/uuid/v5"
-	"go.uber.org/zap/zapcore"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Update represents an update to send to subscribers.
@@ -23,22 +23,20 @@ type Update struct {
 	Debug bool
 }
 
-func (u *Update) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	enc.AddString("id", u.ID)
-	enc.AddString("type", u.Type)
-	enc.AddUint64("retry", u.Retry)
-
-	if err := enc.AddArray("topics", stringArray(u.Topics)); err != nil {
-		return fmt.Errorf("log error: %w", err)
+func (u *Update) LogValue() slog.Value {
+	attrs := []slog.Attr{
+		slog.String("id", u.ID),
+		slog.String("type", u.Type),
+		slog.Uint64("retry", u.Retry),
+		slog.Any("topics", u.Topics),
+		slog.Bool("private", u.Private),
 	}
-
-	enc.AddBool("private", u.Private)
 
 	if u.Debug {
-		enc.AddString("data", u.Data)
+		attrs = append(attrs, slog.String("data", u.Data))
 	}
 
-	return nil
+	return slog.GroupValue(attrs...)
 }
 
 type serializedUpdate struct {
@@ -48,10 +46,23 @@ type serializedUpdate struct {
 }
 
 // AssignUUID generates a new UUID an assign it to the given update if no ID is already set.
-func AssignUUID(u *Update) {
+func (u *Update) AssignUUID() {
 	if u.ID == "" {
-		u.ID = "urn:uuid:" + uuid.Must(uuid.NewV4()).String()
+		u.ID = "urn:uuid:" + uuid.Must(uuid.NewV7()).String()
 	}
+}
+
+// SpanAttributes returns the OpenTelemetry attributes describing this update.
+func (u *Update) SpanAttributes() []attribute.KeyValue {
+	attrs := make([]attribute.KeyValue, 0, 3)
+	if u.ID != "" {
+		attrs = append(attrs, attribute.String("mercure.update.id", u.ID))
+	}
+
+	return append(attrs,
+		attribute.StringSlice("mercure.topics", u.Topics),
+		attribute.Bool("mercure.private", u.Private),
+	)
 }
 
 func newSerializedUpdate(u *Update) *serializedUpdate {

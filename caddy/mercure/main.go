@@ -4,21 +4,18 @@ package main
 import (
 	"log/slog"
 
-	"github.com/caddyserver/caddy/v2"
-
 	"github.com/KimMachineGun/automemlimit/memlimit"
+	"github.com/caddyserver/caddy/v2"
 	caddycmd "github.com/caddyserver/caddy/v2/cmd"
-	"go.uber.org/zap/exp/zapslog"
-
-	// plug in Caddy modules here.
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
 	_ "github.com/dunglas/mercure/caddy"
 	_ "go.uber.org/automaxprocs"
+	"go.uber.org/zap/exp/zapslog"
 )
 
 func main() {
 	// Backport of https://github.com/caddyserver/caddy/pull/6809
-	// TODO: remove this block when Caddy 2.10 will be released
+	// Remove this block when Caddy 2.10 will be released.
 	_, _ = memlimit.SetGoMemLimitWithOpts(
 		memlimit.WithLogger(
 			slog.New(zapslog.NewHandler(caddy.Log().Core())),

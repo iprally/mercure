@@ -1,9 +1,12 @@
+//nolint:funlen,gochecknoinits,gocognit,ireturn,recvcheck,wrapcheck,wsl_v5
 package caddy
 
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 
 	"github.com/caddyserver/caddy/v2"
@@ -11,9 +14,12 @@ import (
 	"github.com/dunglas/mercure"
 )
 
+//nolint:gochecknoinits
 func init() {
-	caddy.RegisterModule(Redis{})
+	caddy.RegisterModule(new(Redis))
 }
+
+var errMissingProjectID = errors.New("project_id is required when using IAM authentication")
 
 type Redis struct {
 	Address         string `json:"address,omitempty"`
@@ -23,15 +29,15 @@ type Redis struct {
 	RedisChannel    string `json:"redis_channel,omitempty"`
 	HistorySize     int    `json:"history_size,omitempty"`
 	// IAM authentication for Google Cloud Memorystore
-	UseIAMAuth      bool   `json:"use_iam_auth,omitempty"`
-	ProjectID       string `json:"project_id,omitempty"`
+	UseIAMAuth bool   `json:"use_iam_auth,omitempty"`
+	ProjectID  string `json:"project_id,omitempty"`
 
 	transport    *mercure.RedisTransport
 	transportKey string
 }
 
 // CaddyModule returns the Caddy module information.
-func (Redis) CaddyModule() caddy.ModuleInfo {
+func (*Redis) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.mercure.redis",
 		New: func() caddy.Module { return new(Redis) },
@@ -50,6 +56,8 @@ func (r *Redis) Provision(ctx caddy.Context) error {
 	}
 	r.transportKey = key.String()
 
+	logger := slog.New(mercure.NewSlogHandler(ctx.Slogger().Handler()))
+
 	destructor, _, err := TransportUsagePool.LoadOrNew(r.transportKey, func() (caddy.Destructor, error) {
 		var t *mercure.RedisTransport
 		var err error
@@ -57,12 +65,12 @@ func (r *Redis) Provision(ctx caddy.Context) error {
 		if r.UseIAMAuth {
 			// Use IAM authentication
 			if r.ProjectID == "" {
-				return nil, fmt.Errorf("project_id is required when using IAM authentication")
+				return nil, errMissingProjectID
 			}
-			t, err = mercure.NewRedisTransportWithIAMAddress(ctx.Logger(), r.Address, r.ProjectID, r.SubscribersSize, r.RedisChannel, r.HistorySize)
+			t, err = mercure.NewRedisTransportWithIAMAddress(logger, r.Address, r.ProjectID, r.SubscribersSize, r.RedisChannel, r.HistorySize)
 		} else {
 			// Use traditional authentication
-			t, err = mercure.NewRedisTransport(ctx.Logger(), r.Address, r.Username, r.Password, r.SubscribersSize, r.RedisChannel, r.HistorySize)
+			t, err = mercure.NewRedisTransport(logger, r.Address, r.Username, r.Password, r.SubscribersSize, r.RedisChannel, r.HistorySize)
 		}
 
 		if err != nil {

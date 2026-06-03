@@ -11,7 +11,7 @@ type localTransportKeyStruct struct{}
 var localTransportKey = localTransportKeyStruct{} //nolint:gochecknoglobals
 
 func init() { //nolint:gochecknoinits
-	caddy.RegisterModule(Local{})
+	caddy.RegisterModule(&Local{})
 }
 
 type Local struct {
@@ -19,7 +19,7 @@ type Local struct {
 }
 
 // CaddyModule returns the Caddy module information.
-func (Local) CaddyModule() caddy.ModuleInfo {
+func (*Local) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.mercure.local",
 		New: func() caddy.Module { return new(Local) },
@@ -31,9 +31,13 @@ func (l *Local) GetTransport() mercure.Transport { //nolint:ireturn
 }
 
 // Provision provisions l's configuration.
-func (l *Local) Provision(_ caddy.Context) error {
+func (l *Local) Provision(ctx caddy.Context) error {
 	destructor, _, _ := TransportUsagePool.LoadOrNew(localTransportKey, func() (caddy.Destructor, error) {
-		return TransportDestructor[*mercure.LocalTransport]{Transport: mercure.NewLocalTransport()}, nil
+		return TransportDestructor[*mercure.LocalTransport]{
+			Transport: mercure.NewLocalTransport(
+				mercure.NewSubscriberList(ctx.Value(SubscriberListCacheSizeContextKey).(int)),
+			),
+		}, nil
 	})
 
 	l.transport = destructor.(TransportDestructor[*mercure.LocalTransport]).Transport
