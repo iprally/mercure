@@ -1,8 +1,10 @@
+//nolint:funlen,gochecknoinits,gocognit,ireturn,recvcheck,wrapcheck,wsl_v5
 package caddy
 
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -12,9 +14,12 @@ import (
 	"github.com/dunglas/mercure"
 )
 
+//nolint:gochecknoinits
 func init() {
-	caddy.RegisterModule(Redis{})
+	caddy.RegisterModule(new(Redis))
 }
+
+var errMissingProjectID = errors.New("project_id is required when using IAM authentication")
 
 type Redis struct {
 	Address         string `json:"address,omitempty"`
@@ -32,7 +37,7 @@ type Redis struct {
 }
 
 // CaddyModule returns the Caddy module information.
-func (Redis) CaddyModule() caddy.ModuleInfo {
+func (*Redis) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.mercure.redis",
 		New: func() caddy.Module { return new(Redis) },
@@ -60,7 +65,7 @@ func (r *Redis) Provision(ctx caddy.Context) error {
 		if r.UseIAMAuth {
 			// Use IAM authentication
 			if r.ProjectID == "" {
-				return nil, fmt.Errorf("project_id is required when using IAM authentication")
+				return nil, errMissingProjectID
 			}
 			t, err = mercure.NewRedisTransportWithIAMAddress(logger, r.Address, r.ProjectID, r.SubscribersSize, r.RedisChannel, r.HistorySize)
 		} else {
