@@ -6,7 +6,8 @@ WORKDIR /image/caddy
 RUN go mod tidy && go build -o ../mercure mercure/main.go
 
 FROM caddy:2-alpine
-RUN apk upgrade --no-cache
+# CVE-2026-34182 (CMS AuthEnvelopedData forgery, CVSS 9.1) and CVE-2026-31789 fixed in openssl 3.5.7-r0
+RUN apk upgrade --no-cache && apk add --no-cache "libssl3>=3.5.7-r0" "libcrypto3>=3.5.7-r0"
 
 LABEL org.opencontainers.image.title=Mercure.rocks
 LABEL org.opencontainers.image.description="Real-time made easy"
