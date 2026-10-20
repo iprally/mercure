@@ -16,6 +16,13 @@ jobs:
       id-token: write
 
     steps:
+      - name: Check the run is on main
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::Images are pushed only from main, got: $GITHUB_REF"
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -41,7 +48,7 @@ jobs:
           token_format: access_token
           access_token_lifetime: 3600s
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: "${{ secrets.GCP_SERVICE_ACCOUNT }}"
+          service_account: "gha-mercure@shared-resources-343513.iam.gserviceaccount.com"
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
       - name: Login to Google Artifact Registry
