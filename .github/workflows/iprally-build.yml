@@ -6,10 +6,6 @@ on:
       - main
   workflow_dispatch:
 
-concurrency:
-  group: iprally-build
-  cancel-in-progress: false
-
 jobs:
   build-and-push:
     if: github.repository == 'iprally/mercure' && github.ref == 'refs/heads/main'
@@ -49,7 +45,18 @@ jobs:
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
+      - name: Check whether this commit is already published
+        id: published
+        run: |
+          if docker manifest inspect "$IMAGE:$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$IMAGE:$GITHUB_SHA already exists; it is not built again"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push Docker image
+        if: steps.published.outputs.exists != 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
