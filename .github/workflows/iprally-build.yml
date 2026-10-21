@@ -6,6 +6,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: iprally-build-${{ github.sha }}
+  cancel-in-progress: false
+
 jobs:
   build-and-push:
     if: github.repository == 'iprally/mercure' && github.ref == 'refs/heads/main'
@@ -48,11 +52,15 @@ jobs:
       - name: Check whether this commit is already published
         id: published
         run: |
-          if docker manifest inspect "$IMAGE:$GITHUB_SHA" >/dev/null 2>&1; then
+          set -uo pipefail
+          if out="$(docker manifest inspect "$IMAGE:$GITHUB_SHA" 2>&1)"; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "::notice::$IMAGE:$GITHUB_SHA already exists; it is not built again"
-          else
+          elif grep -q 'no such manifest' <<< "$out"; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not check whether $IMAGE:$GITHUB_SHA exists: $out"
+            exit 1
           fi
 
       - name: Build and push Docker image
