@@ -51,15 +51,22 @@ jobs:
 
       - name: Check whether this commit is already published
         id: published
+        env:
+          TOKEN: ${{ steps.auth.outputs.access_token }}
         run: |
-          set -uo pipefail
-          if out="$(docker manifest inspect "$IMAGE:$GITHUB_SHA" 2>&1)"; then
+          set -euo pipefail
+          url="https://${IMAGE%%/*}/v2/${IMAGE#*/}/manifests/$GITHUB_SHA"
+          status="$(curl -sS -o "$RUNNER_TEMP/manifest.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "$url")"
+          if [ "$status" = 200 ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "::notice::$IMAGE:$GITHUB_SHA already exists; it is not built again"
-          elif grep -q 'no such manifest' <<< "$out"; then
+          elif [ "$status" = 404 ] && jq -e '.errors | any(.code == "MANIFEST_UNKNOWN")' "$RUNNER_TEMP/manifest.json" > /dev/null; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::Could not check whether $IMAGE:$GITHUB_SHA exists: $out"
+            echo "::error::Could not check whether $IMAGE:$GITHUB_SHA exists: HTTP $status $(cat "$RUNNER_TEMP/manifest.json")"
             exit 1
           fi
 
